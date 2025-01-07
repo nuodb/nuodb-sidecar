@@ -51,21 +51,21 @@ def validate_environment():
     if TARGET_DIRECTORY is None:
         mandatory.append("TARGET_DIRECTORY")
     if len(mandatory) > 0:
-        raise RuntimeError("Mandatory configuration options: {}", ', '.join(mandatory))
+        raise RuntimeError(f"Mandatory configuration options: {', '.join(mandatory)}")
     if os.path.exists(TARGET_DIRECTORY):
         if not os.path.isdir(TARGET_DIRECTORY):
-            raise RuntimeError("Target path {} exists and is not directory", TARGET_DIRECTORY)
+            raise RuntimeError(f"Target path {TARGET_DIRECTORY} exists and is not directory")
     else:
         os.mkdir(TARGET_DIRECTORY)
     if RESOURCE_TYPE not in [RESOURCE_CONFIGMAP, RESOURCE_SECRET]:
-        raise RuntimeError("Unsupported resource type {}", RESOURCE_TYPE)
+        raise RuntimeError(f"Unsupported resource type {RESOURCE_TYPE}")
     if WEBHOOK_URL is not None:
         try:
             urlparse(WEBHOOK_URL)
         except Exception as e:
-            raise RuntimeError("Invalid webhook URL {}", WEBHOOK_URL) from e
+            raise RuntimeError(f"Invalid webhook URL {WEBHOOK_URL}") from e
     if WEBHOOK_METHOD not in ['GET', 'POST', 'PUT', 'PATCH']:
-        raise RuntimeError("Invalid webhook method {}", WEBHOOK_METHOD)
+        raise RuntimeError(f"Invalid webhook method {WEBHOOK_METHOD}")
 
 def load_kube_config():
     namespaces = []
@@ -74,21 +74,21 @@ def load_kube_config():
             namespaces.append(ns)
     try:
         config.load_kube_config(config_file=KUBE_CONFIG_DEFAULT_LOCATION)
-        logging.debug(f"Configuration from '{KUBE_CONFIG_DEFAULT_LOCATION}' file laoded")
+        logging.debug("Configuration from '%s' file laoded", KUBE_CONFIG_DEFAULT_LOCATION)
     except Exception:
         config.load_incluster_config()
         logging.debug("In-cluster configuration loaded")
         # Load the includer namespace
-        if len(namespaces) == 0 and os.path.isfile(NAMESPACE_FILE): 
+        if len(namespaces) == 0 and os.path.isfile(NAMESPACE_FILE):
             with open(NAMESPACE_FILE) as f:
-                namespace = f.read()
+                namespaces.append(f.read())
     configuration = client.Configuration.get_default_copy()
     # Retry Kubernetes client requests
     configuration.retries = DEFAULT_RETRIES
     # Set default namespace
     if len(namespaces) == 0:
         namespaces.append("default")
-    LOGGER.info(f"Connecting to API server '{configuration.host}'")
+    LOGGER.info("Connecting to API server '%s'", configuration.host)
     client.Configuration.set_default(configuration)
     return namespaces
 
@@ -102,7 +102,7 @@ def update_file(path, content, remove=False):
     mode = "w"
     if isinstance(content, (bytes, bytearray)):
         mode += "b"
-    
+
     # Compare with old file content by calculating SHA256 hash
     if os.path.isfile(path):
         if 'b' in mode:
@@ -115,7 +115,7 @@ def update_file(path, content, remove=False):
                 hash_cur.update(byte_block)
         if hash_new.hexdigest() == hash_cur.hexdigest():
             return False
-        
+
     with open(path, mode) as f:
         # Write the content, flush buffers and invoke fsync() to make sure data
         # is written to disk
@@ -143,10 +143,10 @@ def process_resource_data(metadata, data, remove=False):
                 action = "updated"
                 if remove:
                     action = "removed"
-                LOGGER.info(f"File {file_path} content {action}")
+                LOGGER.info("File %s content %s", file_path, action)
                 changed = True
         except Exception as e:
-            LOGGER.warning("Failed to process resource %s/%s data key={key}: %s", 
+            LOGGER.warning("Failed to process resource %s/%s data key={key}: %s",
                             metadata.namespace, metadata.name, e)
     return changed
 
@@ -154,16 +154,17 @@ def invoke_webhook(metadata):
     session = requests.Session()
     session.mount("http://", HTTPAdapter(max_retries=DEFAULT_RETRIES))
     session.mount("https://", HTTPAdapter(max_retries=DEFAULT_RETRIES))
-    LOGGER.info("Invoking webhook after %s/%s resource change\n -> %s %s", 
+    LOGGER.info("Invoking webhook after %s/%s resource change\n -> %s %s",
                 metadata.namespace, metadata.name, WEBHOOK_METHOD, WEBHOOK_URL)
-    resp = session.request(WEBHOOK_METHOD, WEBHOOK_URL, data=WEBHOOK_PAYLOAD, 
+    resp = session.request(WEBHOOK_METHOD, WEBHOOK_URL, data=WEBHOOK_PAYLOAD,
                     timeout=int(WEBHOOK_TIMEOUT), verify=WEBHOOK_VERIFY.lower()=="true")
-    LOGGER.info(f"Webhook response\n <- {resp.status_code} {WEBHOOK_METHOD} {WEBHOOK_URL} {resp.text}")
-        
+    LOGGER.info("Webhook response\n <- %s %s %s %s",
+                resp.status_code, WEBHOOK_METHOD, WEBHOOK_URL, resp.text)
+
 
 
 class ConfigWatcher:
-    def __init__(self, resource, namespace, label_selector, 
+    def __init__(self, resource, namespace, label_selector,
                  request_timeout=60, watch_timeout=60):
         self.resource = resource
         self.namespace = namespace
@@ -176,27 +177,27 @@ class ConfigWatcher:
     def start(self):
         while not self.stopped:
             try:
-                LOGGER.debug("Watching %s resources in namespace %s with selector '%s'", 
+                LOGGER.debug("Watching %s resources in namespace %s with selector '%s'",
                             self.resource, self.namespace, self.label_selector)
-                self.doWatch()
+                self.do_watch()
             except ApiException as e:
-                LOGGER.warning(f"Kubernetes API server error: {e}")
+                LOGGER.warning("Kubernetes API server error: %s", e)
                 time.sleep(5)
             except TimeoutError as e:
-                LOGGER.debug(f"Timeout while reading from API server: {e}")
-            except HTTPError as e:
-                LOGGER.error(f"HTTP error while calling API server: {e}")
-                raise
+                LOGGER.debug("Timeout while reading from API server: %s", e)
             except MaxRetryError as e:
-                LOGGER.error(f"Max retried exausted calling API server: {e}")
+                LOGGER.error("Max retried exausted calling API server: %s", e)
                 raise
-                
+            except HTTPError as e:
+                LOGGER.error("HTTP error while calling API server: %s", e)
+                raise
+
     def stop(self):
         self.stopped = True
         if self.watch:
             self.watch.stop()
 
-    def doWatch(self):
+    def do_watch(self):
         kwargs = {
             'namespace': self.namespace,
             'label_selector': self.label_selector,
@@ -204,21 +205,20 @@ class ConfigWatcher:
             '_request_timeout': self.request_timeout,
         }
         list_func = getattr(client.CoreV1Api(), f"list_namespaced_{self.resource}")
-        client.CoreV1Api().list_namespaced_config_map
         for event in self.watch.stream(list_func, **kwargs):
             event_type = event['type']
             event_object = event['object']
             metadata = event_object.metadata
-            LOGGER.debug("Received %s event for %s %s/%s", 
+            LOGGER.debug("Received %s event for %s %s/%s",
                          event_type, event_object.kind, metadata.namespace, metadata.name)
             resource_removed = event_type == 'DELETED'
-            changed = process_resource_data(event_object.metadata, event_object.data, 
+            changed = process_resource_data(event_object.metadata, event_object.data,
                                             remove=resource_removed)
             if changed and WEBHOOK_URL is not None:
                 try:
                     invoke_webhook(event_object.metadata)
                 except Exception as e:
-                    LOGGER.warning(f"Failed to invoke webhook: {e}")
+                    LOGGER.warning("Failed to invoke webhook: %s", e)
             if self.stopped:
                 return
 
@@ -228,7 +228,7 @@ class NamespaceWatcherThread(Thread):
         self.namespace = namespace
         self.watcher = ConfigWatcher(resource, namespace, selector, **kwargs)
         self.exc_queue = exc_queue
-    
+
     def run(self):
         try:
             self.watcher.start()
@@ -236,7 +236,7 @@ class NamespaceWatcherThread(Thread):
             LOGGER.error("Failed to watch %s namespace: %s", self.namespace, e)
             self.exc_queue.put(e)
             raise
-    
+
     def stop(self):
         LOGGER.info("Stopping config watcher for %s namespace", self.namespace)
         self.watcher.stop()
@@ -248,7 +248,7 @@ def start_watchers(namespaces):
     try:
         # Start a config watcher thread per namespace
         for ns in namespaces:
-            thread = NamespaceWatcherThread(RESOURCE_TYPE, ns, LABEL_SELECTOR, exc_queue, 
+            thread = NamespaceWatcherThread(RESOURCE_TYPE, ns, LABEL_SELECTOR, exc_queue,
                                             watch_timeout=int(WATCH_TIMEOUT))
             thread.start()
             threads.append(thread)
@@ -270,15 +270,15 @@ def start_watchers(namespaces):
             if time.time() - start_time > 5:
                 raise
 
-def main(): 
+def main():
     validate_environment()
     namespaces = load_kube_config()
-    try: 
+    try:
         start_watchers(namespaces)
     except KeyboardInterrupt:
         LOGGER.info("Exiting due to interrupt...")
         sys.exit(1)
-    except Exception as e:
+    except Exception:
         traceback.print_exc(file=sys.stderr)
         sys.exit(1)
 

@@ -20,6 +20,11 @@ IGNORE_NOT_FOUND ?= true
 IMG_REPO ?= nuodb/nuodb-sidecar
 IMG_TAG ?= latest
 
+# Python linter
+PYLINT = python3 -m pylint
+PYLINTFLAGS = -rn
+PYTHONFILES := $(shell find $(PROJECT_DIR) -type f -name "*.py" -not -path "$(PROJECT_DIR)/.*/*")
+
 ##@ General
 
 # The help target prints out all targets with their descriptions organized
@@ -37,7 +42,30 @@ IMG_TAG ?= latest
 help: ## Display this help.
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
 
-##@ Dependencies
+##@ Development
+
+.PHONY: lint
+lint: $(patsubst %.py,%.pylint,$(PYTHONFILES)) ## Lint Python files
+
+##@ Testing
+
+.PHONY: test
+test: test-config-watcher ## Run tests
+
+test-config-watcher: test-setup
+
+test-setup: $(KWOKCTL) $(KUBECTL) ## Run tests setup
+	mkdir -p $(OUTPUT_DIR) $(TMP_DIR)
+	@[ ! -x "./k8s-config-watcher/test/setup.sh" ] || ./k8s-config-watcher/test/setup.sh
+
+test-tierdown: ## Run tests tierdown
+	[ ! -x "./k8s-config-watcher/test/tierdown.sh" ] || ./k8s-config-watcher/test/tierdown.sh
+
+##@ Build
+
+.PHONY: docker-build
+docker-build: ## Build NuoDB sidecar docker image.
+	IMG_REPO="$(IMG_REPO)" IMG_TAG="$(IMG_TAG)" ./docker/build.sh
 
 $(KUBECTL):
 	mkdir -p bin
@@ -49,32 +77,5 @@ $(KWOKCTL):
 	curl -L -s https://github.com/kubernetes-sigs/kwok/releases/download/v$(KWOKCTL_VERSION)/kwokctl-$(OS)-$(ARCH) -o $(KWOKCTL)
 	chmod +x $(KWOKCTL)
 
-bin/%:
-	$(MAKE) install-tools
-
-
-##@ Development
-
-
-
-##@ Testing
-
-.PHONY: test
-test: test-config-watcher
-
-.PHONY: test-config-watcher
-test-config-watcher: test-setup
-
-
-test-setup: $(KWOKCTL) $(KUBECTL)
-	mkdir -p $(OUTPUT_DIR) $(TMP_DIR)
-	@[ ! -x "./k8s-config-watcher/test/setup.sh" ] || ./k8s-config-watcher/test/setup.sh
-
-test-tierdown:
-	[ ! -x "./k8s-config-watcher/test/tierdown.sh" ] || ./k8s-config-watcher/test/tierdown.sh
-
-##@ Build
-
-.PHONY: docker-build
-docker-build: ## Build docker image with NuoDB Control Plane.
-	IMG_REPO="$(IMG_REPO)" IMG_TAG="$(IMG_TAG)" ./docker/build.sh
+%.pylint:
+	$(PYLINT) $(PYLINTFLAGS) $*.py

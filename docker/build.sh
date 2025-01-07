@@ -20,7 +20,6 @@ GIT_STATUS="$(git status --porcelain)"
 # Build the image and label it with commit SHA
 : ${IMG_REPO:="nuodb/nuodb-sidecar"}
 : ${IMG_TAG:="latest"}
-: ${IMG_BUILD:="true"}
 
 docker build -f ./docker/Dockerfile . --tag "$IMG_REPO:$IMG_TAG" --label org.opencontainers.image.revision="$COMMIT"
 
