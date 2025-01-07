@@ -174,7 +174,7 @@ class ConfigWatcher:
         self.watch = watch.Watch()
 
     def start(self):
-        while True:
+        while not self.stopped:
             try:
                 LOGGER.debug("Watching %s resources in namespace %s with selector '%s'", 
                             self.resource, self.namespace, self.label_selector)
@@ -190,8 +190,6 @@ class ConfigWatcher:
             except MaxRetryError as e:
                 LOGGER.error(f"Max retried exausted calling API server: {e}")
                 raise
-            if self.stopped:
-                return
                 
     def stop(self):
         self.stopped = True
@@ -206,6 +204,7 @@ class ConfigWatcher:
             '_request_timeout': self.request_timeout,
         }
         list_func = getattr(client.CoreV1Api(), f"list_namespaced_{self.resource}")
+        client.CoreV1Api().list_namespaced_config_map
         for event in self.watch.stream(list_func, **kwargs):
             event_type = event['type']
             event_object = event['object']
@@ -220,6 +219,8 @@ class ConfigWatcher:
                     invoke_webhook(event_object.metadata)
                 except Exception as e:
                     LOGGER.warning(f"Failed to invoke webhook: {e}")
+            if self.stopped:
+                return
 
 class NamespaceWatcherThread(Thread):
     def __init__(self, resource, namespace, selector, exc_queue, **kwargs):
