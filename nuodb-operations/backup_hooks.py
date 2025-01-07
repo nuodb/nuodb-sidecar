@@ -228,7 +228,8 @@ def pre_backup(backup_id, payload):
         ):
             # Remote the backup files from the previous pre-backup operation
             LOGGER.warning(
-                "Unexpected start ID: current=%s, stored=%s. SM process restarted while executing backup ID %s.",
+                "Unexpected start ID: current=%s, stored=%s. " +
+                "SM process restarted while executing backup ID %s.",
                 processes[0]["sid"],
                 stored_start_id,
                 get_backup_id(),
@@ -236,9 +237,8 @@ def pre_backup(backup_id, payload):
             remove_backup_files()
         else:
             raise UserError(
-                "Backup ID file {} exists. Execute post-backup hook to complete current backup.".format(
-                    ARCHIVE_BACKUP_ID_FILE
-                )
+                f"Backup ID file {ARCHIVE_BACKUP_ID_FILE} exists. " +
+                "Execute post-backup hook to complete current backup."
             )
     # Get timeout for the operation if specified
     timeout = get_backup_timeout(payload)
@@ -499,6 +499,7 @@ class ScriptHandler(object):
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             env=env,
+            check=False
         )
         # Map exit code to HTTP status
         return self.map_status(proc), proc.stdout
@@ -538,7 +539,7 @@ def read_handler_config(handler_config):
         return []
 
 
-class RequestInfo(object):
+class RequestInfo(object): # pylint: disable=too-few-public-methods
     def __init__(self, environ):
         self.method = environ.get("REQUEST_METHOD")
         # Parse URL and make sure it contains at least one path component
@@ -567,7 +568,7 @@ def handle_method(req):
                     decoded_payload = json.loads(req.payload) if req.payload else None
                     args.insert(pos_args.index("payload"), decoded_payload)
                 except json.JSONDecodeError as e:
-                    raise UserError("Unable to decode request payload: " + str(e))
+                    raise UserError("Unable to decode request payload: {}" + str(e)) # pylint: disable=raise-missing-from
             # If `query` is in the method signature, then parse the query
             # parameters as a dictionary and pass them at the corresponding
             # index
@@ -682,8 +683,7 @@ def verify_prerequisites():
     elif FREEZE_MODE == MODE_FSFREEZE and which("fsfreeze") is None:
         raise RuntimeError("'fsfreeze' command not found")
 
-
-if __name__ == "__main__":
+def main():
     # Create CLI parser for direct invocation
     parser = argparse.ArgumentParser(sys.argv[0])
     subparsers = parser.add_subparsers(dest="subcommand")
@@ -715,3 +715,6 @@ if __name__ == "__main__":
         pre_backup(args.backup_id, dict(opaque=opaque, timeout=args.timeout))
     elif args.subcommand == "post-hook":
         post_backup(args.backup_id, dict(force=args.force))
+
+if __name__ == "__main__":
+    main()
