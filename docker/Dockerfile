@@ -24,3 +24,5 @@ COPY --chown=1000:1000 docker/entrypoint.sh /usr/local/bin/
 RUN pip3 install -r /opt/k8s-config-watcher/requirements.txt
 
 ENTRYPOINT ["entrypoint.sh"]
+
+CMD [ "config-watcher" ]

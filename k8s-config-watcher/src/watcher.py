@@ -16,7 +16,7 @@ from kubernetes.client import ApiException
 from kubernetes.config.kube_config import KUBE_CONFIG_DEFAULT_LOCATION
 
 from urllib3.util.retry import Retry
-from urllib3.exceptions import MaxRetryError, HTTPError
+from urllib3.exceptions import MaxRetryError, HTTPError, TimeoutError
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -28,12 +28,12 @@ RESOURCE_CONFIGMAP = "config_map"
 RESOURCE_SECRET = "secret"
 
 NAMESPACES = os.environ.get("NAMESPACES")
-LABEL_SELECTOR = os.environ.get("LABEL_SELECTOR")
-TARGET_DIRECTORY = os.environ.get("TARGET_DIRECTORY")
+LABEL_SELECTOR = os.environ.get("LABEL_SELECTOR", os.environ.get("LABEL"))
+TARGET_DIRECTORY = os.environ.get("TARGET_DIRECTORY", os.environ.get("FOLDER"))
 RESOURCE_TYPE = os.environ.get("RESOURCE_TYPE", RESOURCE_CONFIGMAP)
 WATCH_TIMEOUT = os.environ.get("WATCH_TIMEOUT", "60")
 
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", os.environ.get("REQ_URL"))
 WEBHOOK_METHOD = os.environ.get("WEBHOOK_METHOD", "GET")
 WEBHOOK_PAYLOAD = os.environ.get("WEBHOOK_PAYLOAD")
 WEBHOOK_TIMEOUT = os.environ.get("WEBHOOK_TIMEOUT", "60")
@@ -41,7 +41,6 @@ WEBHOOK_VERIFY = os.environ.get("WEBHOOK_VERIFY", "true")
 
 NAMESPACE_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
 DEFAULT_RETRIES = Retry(connect=5, read=5, backoff_factor=0.5)
-
 
 def validate_environment():
     # Validate mandatory config
@@ -241,7 +240,6 @@ class NamespaceWatcherThread(Thread):
         LOGGER.info("Stopping config watcher for %s namespace", self.namespace)
         self.watcher.stop()
 
-
 def start_watchers(namespaces):
     threads = []
     exc_queue = queue.Queue()
@@ -258,17 +256,20 @@ def start_watchers(namespaces):
             raise exc
     except BaseException:
         # Stop all threads
-        for t in threads:
-            t.stop()
-        # Wait 5s for all threads to stop for 5s
-        start_time = time.time()
-        while len(threads) > 0:
-            t = threads.pop(0)
-            t.join(0.1)
-            if t.is_alive():
-                threads.append(thread)
-            if time.time() - start_time > 5:
-                raise
+        stop_watchers(threads)
+
+def stop_watchers(threads, timeout=2):
+    for t in threads:
+        t.stop()
+    # Wait for all threads to stop
+    start_time = time.time()
+    while len(threads) > 0:
+        t = threads.pop(0)
+        t.join(0.1)
+        if t.is_alive():
+            threads.append(t)
+        if time.time() - start_time > timeout:
+            raise
 
 def main():
     validate_environment()
