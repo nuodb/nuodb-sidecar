@@ -16,6 +16,10 @@ KWOKCTL := bin/kwokctl
 
 IGNORE_NOT_FOUND ?= true
 
+# Image to use all building/pushing image targets
+IMG_REPO ?= nuodb/nuodb-sidecar
+IMG_TAG ?= latest
+
 ##@ General
 
 # The help target prints out all targets with their descriptions organized
@@ -69,6 +73,8 @@ test-setup: $(KWOKCTL) $(KUBECTL)
 test-tierdown:
 	[ ! -x "./k8s-config-watcher/test/tierdown.sh" ] || ./k8s-config-watcher/test/tierdown.sh
 
-##@ Packaging
+##@ Build
 
-
+.PHONY: docker-build
+docker-build: ## Build docker image with NuoDB Control Plane.
+	IMG_REPO="$(IMG_REPO)" IMG_TAG="$(IMG_TAG)" ./docker/build.sh
