@@ -44,5 +44,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: test-results-${{ matrix.python-version }}
-          path: test-results
+          path: |
+            test-results/config_watcher
           retention-days: 7
