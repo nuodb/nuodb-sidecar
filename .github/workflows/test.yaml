@@ -1,0 +1,48 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches:
+      - "main"
+
+jobs:
+  continuous:
+    name: Continuous
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+      - name: Install dependencies
+        run: |
+          pip install pylint pytest pytest-cov
+          pip install -r config_watcher/requirements.txt
+      - name: Run static checks
+        run: make lint
+      - name: Run tests
+        run: make test
+      - name: Test report
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: results-config-watcher-${{ matrix.python-version }}
+          path: test-results/reports/config_watcher.xml
+          reporter: java-junit
+          fail-on-error: true
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.python-version }}
+          path: test-results
+          retention-days: 7

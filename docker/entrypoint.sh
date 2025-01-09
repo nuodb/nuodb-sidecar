@@ -19,9 +19,9 @@ esac
 
 # Support well-known commands
 case "$1" in
-    (config-watcher)
+    (config_watcher)
         shift
-        exec python3 /opt/k8s-config-watcher/watcher.py "$@"
+        exec python3 /opt/config_watcher/watcher.py "$@"
         ;;
     (nuodb-operations)
         shift

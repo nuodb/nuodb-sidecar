@@ -1,9 +1,9 @@
 PROJECT_DIR := $(shell pwd)
 BIN_DIR ?= $(PROJECT_DIR)/bin
-export TEST_RESULTS ?= $(PROJECT_DIR)/test-results
-export TMP_DIR ?= $(PROJECT_DIR)/tmp
+OUTPUT_DIR ?= $(PROJECT_DIR)/test-results
+export TMP_DIR ?= $(OUTPUT_DIR)/tmp
 export PATH := $(BIN_DIR):$(PATH)
-export OUTPUT_DIR ?= $(TMP_DIR)/test-artifacts
+export KUBECONFIG ?= $(TMP_DIR)/kubeconfig.yaml
 
 OS := $(shell go env GOOS)
 ARCH := $(shell go env GOARCH)
@@ -23,7 +23,7 @@ IMG_TAG ?= latest
 # Python linter
 PYLINT = python3 -m pylint
 PYLINTFLAGS = -rn
-PYTHONFILES := $(shell find $(PROJECT_DIR) -type f -name "*.py" -not -path "$(PROJECT_DIR)/.*/*")
+PYTHONFILES := $(shell find $(PROJECT_DIR) -type f -name "*.py" -not -path "$(PROJECT_DIR)/.*/*" -not -path "*/test_*.py")
 
 ##@ General
 
@@ -53,13 +53,16 @@ lint: $(patsubst %.py,%.pylint,$(PYTHONFILES)) ## Lint Python files
 test: test-config-watcher ## Run tests
 
 test-config-watcher: test-setup
+	cd config_watcher \
+		&& python3 -m pytest \
+			--junitxml $(OUTPUT_DIR)/reports/config_watcher.xml
 
 test-setup: $(KWOKCTL) $(KUBECTL) ## Run tests setup
-	mkdir -p $(OUTPUT_DIR) $(TMP_DIR)
-	@[ ! -x "./k8s-config-watcher/test/setup.sh" ] || ./k8s-config-watcher/test/setup.sh
+	mkdir -p $(TMP_DIR)
+	@[ ! -x "./config_watcher/test_setup.sh" ] || ./config_watcher/test_setup.sh
 
-test-tierdown: ## Run tests tierdown
-	[ ! -x "./k8s-config-watcher/test/tierdown.sh" ] || ./k8s-config-watcher/test/tierdown.sh
+test-tierdown: $(KWOKCTL) ## Run tests tierdown
+	@[ ! -x "./config_watcher/test_teardown.sh" ] || ./config_watcher/test_teardown.sh
 
 ##@ Build
 

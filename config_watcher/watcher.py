@@ -16,12 +16,16 @@ from kubernetes.client import ApiException
 from kubernetes.config.kube_config import KUBE_CONFIG_DEFAULT_LOCATION
 
 from urllib3.util.retry import Retry
-from urllib3.exceptions import MaxRetryError, HTTPError, TimeoutError
+from urllib3.exceptions import MaxRetryError, HTTPError, TimeoutError as UrlLibTimeoutError
 
 import requests
 from requests.adapters import HTTPAdapter
 
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(message)s")
+LOG = os.environ.get("LOG", "INFO")
+log_level = getattr(logging, LOG.upper(), None)
+if not isinstance(log_level, int):
+    raise RuntimeError(f'Invalid log level: {log_level}')
+logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s %(message)s")
 LOGGER = logging.getLogger(__name__)
 
 RESOURCE_CONFIGMAP = "config_map"
@@ -32,6 +36,7 @@ LABEL_SELECTOR = os.environ.get("LABEL_SELECTOR", os.environ.get("LABEL"))
 TARGET_DIRECTORY = os.environ.get("TARGET_DIRECTORY", os.environ.get("FOLDER"))
 RESOURCE_TYPE = os.environ.get("RESOURCE_TYPE", RESOURCE_CONFIGMAP)
 WATCH_TIMEOUT = os.environ.get("WATCH_TIMEOUT", "60")
+SHUTDOWN_TIMEOUT = os.environ.get("SHUTDOWN_TIMEOUT", "0")
 
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", os.environ.get("REQ_URL"))
 WEBHOOK_METHOD = os.environ.get("WEBHOOK_METHOD", "GET")
@@ -57,14 +62,21 @@ def validate_environment():
     else:
         os.mkdir(TARGET_DIRECTORY)
     if RESOURCE_TYPE not in [RESOURCE_CONFIGMAP, RESOURCE_SECRET]:
-        raise RuntimeError(f"Unsupported resource type {RESOURCE_TYPE}")
+        raise RuntimeError(f"Unsupported resource type: {RESOURCE_TYPE}")
     if WEBHOOK_URL is not None:
         try:
-            urlparse(WEBHOOK_URL)
+            result = urlparse(WEBHOOK_URL)
+            if not result.scheme or not result.netloc:
+                raise RuntimeError("schema or location missing")
         except Exception as e:
-            raise RuntimeError(f"Invalid webhook URL {WEBHOOK_URL}") from e
+            raise RuntimeError(f"Invalid webhook URL: {WEBHOOK_URL}") from e
     if WEBHOOK_METHOD not in ['GET', 'POST', 'PUT', 'PATCH']:
-        raise RuntimeError(f"Invalid webhook method {WEBHOOK_METHOD}")
+        raise RuntimeError(f"Invalid webhook method: {WEBHOOK_METHOD}")
+    for k, v in {'shutdown timeout': SHUTDOWN_TIMEOUT, 'webhook timeout': WEBHOOK_TIMEOUT}.items():
+        try:
+            float(v)
+        except ValueError as e:
+            raise RuntimeError(f"Invalid {k}: {v}") from e
 
 def load_kube_config():
     namespaces = []
@@ -73,11 +85,11 @@ def load_kube_config():
             namespaces.append(ns)
     try:
         config.load_kube_config(config_file=KUBE_CONFIG_DEFAULT_LOCATION)
-        logging.debug("Configuration from '%s' file laoded", KUBE_CONFIG_DEFAULT_LOCATION)
+        LOGGER.debug("Configuration from '%s' file laoded", KUBE_CONFIG_DEFAULT_LOCATION)
     except Exception:
+        # Load in-cluster configuration
         config.load_incluster_config()
-        logging.debug("In-cluster configuration loaded")
-        # Load the includer namespace
+        LOGGER.debug("In-cluster configuration loaded")
         if len(namespaces) == 0 and os.path.isfile(NAMESPACE_FILE):
             with open(NAMESPACE_FILE) as f:
                 namespaces.append(f.read())
@@ -176,13 +188,13 @@ class ConfigWatcher:
     def start(self):
         while not self.stopped:
             try:
-                LOGGER.debug("Watching %s resources in namespace %s with selector '%s'",
+                LOGGER.debug("Watching %s resources in namespace '%s' with selector '%s'",
                             self.resource, self.namespace, self.label_selector)
                 self.do_watch()
             except ApiException as e:
                 LOGGER.warning("Kubernetes API server error: %s", e)
                 time.sleep(5)
-            except TimeoutError as e:
+            except UrlLibTimeoutError as e:
                 LOGGER.debug("Timeout while reading from API server: %s", e)
             except MaxRetryError as e:
                 LOGGER.error("Max retried exausted calling API server: %s", e)
@@ -240,25 +252,32 @@ class NamespaceWatcherThread(Thread):
         LOGGER.info("Stopping config watcher for %s namespace", self.namespace)
         self.watcher.stop()
 
-def start_watchers(namespaces):
+def start_watchers(namespaces, exc_queue):
     threads = []
-    exc_queue = queue.Queue()
-    try:
+    for ns in namespaces:
         # Start a config watcher thread per namespace
-        for ns in namespaces:
-            thread = NamespaceWatcherThread(RESOURCE_TYPE, ns, LABEL_SELECTOR, exc_queue,
-                                            watch_timeout=int(WATCH_TIMEOUT))
-            thread.start()
-            threads.append(thread)
-        # Wait for watchers
+        thread = NamespaceWatcherThread(RESOURCE_TYPE, ns, LABEL_SELECTOR, exc_queue,
+                                        watch_timeout=int(WATCH_TIMEOUT))
+        thread.start()
+        threads.append(thread)
+    return threads
+
+def watch_namespaces(namespaces):
+    threads = None
+    try:
+        # Start all watchers
+        exc_queue = queue.Queue()
+        threads = start_watchers(namespaces, exc_queue)
+        # Block until at least one watcher dies
         exc = exc_queue.get()
         if exc is not None:
             raise exc
-    except BaseException:
+    except:
         # Stop all threads
-        stop_watchers(threads)
+        stop_watchers(threads, timeout=float(SHUTDOWN_TIMEOUT))
+        raise
 
-def stop_watchers(threads, timeout=2):
+def stop_watchers(threads, timeout=5):
     for t in threads:
         t.stop()
     # Wait for all threads to stop
@@ -269,13 +288,13 @@ def stop_watchers(threads, timeout=2):
         if t.is_alive():
             threads.append(t)
         if time.time() - start_time > timeout:
-            raise
+            return
 
 def main():
     validate_environment()
-    namespaces = load_kube_config()
     try:
-        start_watchers(namespaces)
+        namespaces = load_kube_config()
+        watch_namespaces(namespaces)
     except KeyboardInterrupt:
         LOGGER.info("Exiting due to interrupt...")
         sys.exit(1)
