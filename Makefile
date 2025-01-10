@@ -24,6 +24,7 @@ IMG_TAG ?= latest
 PYLINT = python3 -m pylint
 PYLINTFLAGS = -rn
 PYTHONFILES := $(shell find $(PROJECT_DIR) -type f -name "*.py" -not -path "$(PROJECT_DIR)/.*/*" -not -path "*/test_*.py")
+PYTHONTESTFILES := $(shell find $(PROJECT_DIR) -type f -name "test_*.py" -not -path "$(PROJECT_DIR)/.*/*")
 
 ##@ General
 
@@ -46,6 +47,10 @@ help: ## Display this help.
 
 .PHONY: lint
 lint: $(patsubst %.py,%.pylint,$(PYTHONFILES)) ## Lint Python files
+
+.PHONY: fmt ## Format Python files
+fmt:
+	python3 -m black --quiet $(PYTHONFILES) $(PYTHONTESTFILES)
 
 ##@ Testing
 

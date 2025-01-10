@@ -16,7 +16,11 @@ from kubernetes.client import ApiException
 from kubernetes.config.kube_config import KUBE_CONFIG_DEFAULT_LOCATION
 
 from urllib3.util.retry import Retry
-from urllib3.exceptions import MaxRetryError, HTTPError, TimeoutError as UrlLibTimeoutError
+from urllib3.exceptions import (
+    MaxRetryError,
+    HTTPError,
+    TimeoutError as UrlLibTimeoutError,
+)
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -24,7 +28,7 @@ from requests.adapters import HTTPAdapter
 LOG = os.environ.get("LOG", "INFO")
 log_level = getattr(logging, LOG.upper(), None)
 if not isinstance(log_level, int):
-    raise RuntimeError(f'Invalid log level: {log_level}')
+    raise RuntimeError(f"Invalid log level: {log_level}")
 logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s %(message)s")
 LOGGER = logging.getLogger(__name__)
 
@@ -47,6 +51,7 @@ WEBHOOK_VERIFY = os.environ.get("WEBHOOK_VERIFY", "true")
 NAMESPACE_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
 DEFAULT_RETRIES = Retry(connect=5, read=5, backoff_factor=0.5)
 
+
 def validate_environment():
     # Validate mandatory config
     mandatory = []
@@ -58,7 +63,9 @@ def validate_environment():
         raise RuntimeError(f"Mandatory configuration options: {', '.join(mandatory)}")
     if os.path.exists(TARGET_DIRECTORY):
         if not os.path.isdir(TARGET_DIRECTORY):
-            raise RuntimeError(f"Target path {TARGET_DIRECTORY} exists and is not directory")
+            raise RuntimeError(
+                f"Target path {TARGET_DIRECTORY} exists and is not directory"
+            )
     else:
         os.mkdir(TARGET_DIRECTORY)
     if RESOURCE_TYPE not in [RESOURCE_CONFIGMAP, RESOURCE_SECRET]:
@@ -70,13 +77,17 @@ def validate_environment():
                 raise RuntimeError("schema or location missing")
         except Exception as e:
             raise RuntimeError(f"Invalid webhook URL: {WEBHOOK_URL}") from e
-    if WEBHOOK_METHOD not in ['GET', 'POST', 'PUT', 'PATCH']:
+    if WEBHOOK_METHOD not in ["GET", "POST", "PUT", "PATCH"]:
         raise RuntimeError(f"Invalid webhook method: {WEBHOOK_METHOD}")
-    for k, v in {'shutdown timeout': SHUTDOWN_TIMEOUT, 'webhook timeout': WEBHOOK_TIMEOUT}.items():
+    for k, v in {
+        "shutdown timeout": SHUTDOWN_TIMEOUT,
+        "webhook timeout": WEBHOOK_TIMEOUT,
+    }.items():
         try:
             float(v)
         except ValueError as e:
             raise RuntimeError(f"Invalid {k}: {v}") from e
+
 
 def load_kube_config():
     namespaces = []
@@ -85,7 +96,9 @@ def load_kube_config():
             namespaces.append(ns)
     try:
         config.load_kube_config(config_file=KUBE_CONFIG_DEFAULT_LOCATION)
-        LOGGER.debug("Configuration from '%s' file laoded", KUBE_CONFIG_DEFAULT_LOCATION)
+        LOGGER.debug(
+            "Configuration from '%s' file laoded", KUBE_CONFIG_DEFAULT_LOCATION
+        )
     except Exception:
         # Load in-cluster configuration
         config.load_incluster_config()
@@ -103,6 +116,7 @@ def load_kube_config():
     client.Configuration.set_default(configuration)
     return namespaces
 
+
 def update_file(path, content, remove=False):
     if remove:
         # Remove the file if exist
@@ -116,11 +130,11 @@ def update_file(path, content, remove=False):
 
     # Compare with old file content by calculating SHA256 hash
     if os.path.isfile(path):
-        if 'b' in mode:
+        if "b" in mode:
             hash_new = sha256(content)
         else:
-            hash_new = sha256(content.encode('utf-8'))
-        with open(path, 'rb') as f:
+            hash_new = sha256(content.encode("utf-8"))
+        with open(path, "rb") as f:
             hash_cur = sha256()
             for byte_block in iter(lambda: f.read(4096), b""):
                 hash_cur.update(byte_block)
@@ -142,6 +156,7 @@ def update_file(path, content, remove=False):
         os.chmod(path, mode=0o660)
     return True
 
+
 def process_resource_data(metadata, data, remove=False):
     changed = False
     for key in data.keys():
@@ -157,26 +172,46 @@ def process_resource_data(metadata, data, remove=False):
                 LOGGER.info("File %s content %s", file_path, action)
                 changed = True
         except Exception as e:
-            LOGGER.warning("Failed to process resource %s/%s data key={key}: %s",
-                            metadata.namespace, metadata.name, e)
+            LOGGER.warning(
+                "Failed to process resource %s/%s data key={key}: %s",
+                metadata.namespace,
+                metadata.name,
+                e,
+            )
     return changed
+
 
 def invoke_webhook(metadata):
     session = requests.Session()
     session.mount("http://", HTTPAdapter(max_retries=DEFAULT_RETRIES))
     session.mount("https://", HTTPAdapter(max_retries=DEFAULT_RETRIES))
-    LOGGER.info("Invoking webhook after %s/%s resource change\n -> %s %s",
-                metadata.namespace, metadata.name, WEBHOOK_METHOD, WEBHOOK_URL)
-    resp = session.request(WEBHOOK_METHOD, WEBHOOK_URL, data=WEBHOOK_PAYLOAD,
-                    timeout=int(WEBHOOK_TIMEOUT), verify=WEBHOOK_VERIFY.lower()=="true")
-    LOGGER.info("Webhook response\n <- %s %s %s %s",
-                resp.status_code, WEBHOOK_METHOD, WEBHOOK_URL, resp.text)
-
+    LOGGER.info(
+        "Invoking webhook after %s/%s resource change\n -> %s %s",
+        metadata.namespace,
+        metadata.name,
+        WEBHOOK_METHOD,
+        WEBHOOK_URL,
+    )
+    resp = session.request(
+        WEBHOOK_METHOD,
+        WEBHOOK_URL,
+        data=WEBHOOK_PAYLOAD,
+        timeout=int(WEBHOOK_TIMEOUT),
+        verify=WEBHOOK_VERIFY.lower() == "true",
+    )
+    LOGGER.info(
+        "Webhook response\n <- %s %s %s %s",
+        resp.status_code,
+        WEBHOOK_METHOD,
+        WEBHOOK_URL,
+        resp.text,
+    )
 
 
 class ConfigWatcher:
-    def __init__(self, resource, namespace, label_selector,
-                 request_timeout=60, watch_timeout=60):
+    def __init__(
+        self, resource, namespace, label_selector, request_timeout=60, watch_timeout=60
+    ):
         self.resource = resource
         self.namespace = namespace
         self.label_selector = label_selector
@@ -188,8 +223,12 @@ class ConfigWatcher:
     def start(self):
         while not self.stopped:
             try:
-                LOGGER.debug("Watching %s resources in namespace '%s' with selector '%s'",
-                            self.resource, self.namespace, self.label_selector)
+                LOGGER.debug(
+                    "Watching %s resources in namespace '%s' with selector '%s'",
+                    self.resource,
+                    self.namespace,
+                    self.label_selector,
+                )
                 self.do_watch()
             except ApiException as e:
                 LOGGER.warning("Kubernetes API server error: %s", e)
@@ -210,21 +249,27 @@ class ConfigWatcher:
 
     def do_watch(self):
         kwargs = {
-            'namespace': self.namespace,
-            'label_selector': self.label_selector,
-            'timeout_seconds': self.watch_timeout,
-            '_request_timeout': self.request_timeout,
+            "namespace": self.namespace,
+            "label_selector": self.label_selector,
+            "timeout_seconds": self.watch_timeout,
+            "_request_timeout": self.request_timeout,
         }
         list_func = getattr(client.CoreV1Api(), f"list_namespaced_{self.resource}")
         for event in self.watch.stream(list_func, **kwargs):
-            event_type = event['type']
-            event_object = event['object']
+            event_type = event["type"]
+            event_object = event["object"]
             metadata = event_object.metadata
-            LOGGER.debug("Received %s event for %s %s/%s",
-                         event_type, event_object.kind, metadata.namespace, metadata.name)
-            resource_removed = event_type == 'DELETED'
-            changed = process_resource_data(event_object.metadata, event_object.data,
-                                            remove=resource_removed)
+            LOGGER.debug(
+                "Received %s event for %s %s/%s",
+                event_type,
+                event_object.kind,
+                metadata.namespace,
+                metadata.name,
+            )
+            resource_removed = event_type == "DELETED"
+            changed = process_resource_data(
+                event_object.metadata, event_object.data, remove=resource_removed
+            )
             if changed and WEBHOOK_URL is not None:
                 try:
                     invoke_webhook(event_object.metadata)
@@ -232,6 +277,7 @@ class ConfigWatcher:
                     LOGGER.warning("Failed to invoke webhook: %s", e)
             if self.stopped:
                 return
+
 
 class NamespaceWatcherThread(Thread):
     def __init__(self, resource, namespace, selector, exc_queue, **kwargs):
@@ -252,15 +298,22 @@ class NamespaceWatcherThread(Thread):
         LOGGER.info("Stopping config watcher for %s namespace", self.namespace)
         self.watcher.stop()
 
+
 def start_watchers(namespaces, exc_queue):
     threads = []
     for ns in namespaces:
         # Start a config watcher thread per namespace
-        thread = NamespaceWatcherThread(RESOURCE_TYPE, ns, LABEL_SELECTOR, exc_queue,
-                                        watch_timeout=int(WATCH_TIMEOUT))
+        thread = NamespaceWatcherThread(
+            RESOURCE_TYPE,
+            ns,
+            LABEL_SELECTOR,
+            exc_queue,
+            watch_timeout=int(WATCH_TIMEOUT),
+        )
         thread.start()
         threads.append(thread)
     return threads
+
 
 def watch_namespaces(namespaces):
     threads = None
@@ -277,6 +330,7 @@ def watch_namespaces(namespaces):
         stop_watchers(threads, timeout=float(SHUTDOWN_TIMEOUT))
         raise
 
+
 def stop_watchers(threads, timeout=5):
     for t in threads:
         t.stop()
@@ -290,6 +344,7 @@ def stop_watchers(threads, timeout=5):
         if time.time() - start_time > timeout:
             return
 
+
 def main():
     validate_environment()
     try:
@@ -301,6 +356,7 @@ def main():
     except Exception:
         traceback.print_exc(file=sys.stderr)
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

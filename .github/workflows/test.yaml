@@ -25,8 +25,18 @@ jobs:
           cache: 'pip'
       - name: Install dependencies
         run: |
-          pip install pylint pytest pytest-cov
+          pip install -r config_watcher/test-requirements.txt
           pip install -r config_watcher/requirements.txt
+      - name: Test code formatting
+        run: |
+          make fmt
+          status="$(git status --porcelain)"
+          if [ -n "$status" ]; then
+            echo "ERROR: There are unexpected code changes" >&2
+            echo "$status" >&2
+            git diff >&2
+            exit 1
+          fi
       - name: Run static checks
         run: make lint
       - name: Run tests
