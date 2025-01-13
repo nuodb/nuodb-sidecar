@@ -49,7 +49,13 @@ WEBHOOK_TIMEOUT = os.environ.get("WEBHOOK_TIMEOUT", "60")
 WEBHOOK_VERIFY = os.environ.get("WEBHOOK_VERIFY", "true")
 
 NAMESPACE_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
-DEFAULT_RETRIES = Retry(connect=5, read=5, backoff_factor=0.5)
+RETRY_COUNT = 5
+DEFAULT_RETRIES = Retry(
+    connect=RETRY_COUNT,
+    read=RETRY_COUNT,
+    total=RETRY_COUNT,
+    backoff_factor=0.5,
+)
 
 
 def validate_environment():
@@ -97,7 +103,7 @@ def load_kube_config():
     try:
         config.load_kube_config(config_file=KUBE_CONFIG_DEFAULT_LOCATION)
         LOGGER.debug(
-            "Configuration from '%s' file laoded", KUBE_CONFIG_DEFAULT_LOCATION
+            "Configuration from '%s' file loaded", KUBE_CONFIG_DEFAULT_LOCATION
         )
     except Exception:
         # Load in-cluster configuration
@@ -173,9 +179,10 @@ def process_resource_data(metadata, data, remove=False):
                 changed = True
         except Exception as e:
             LOGGER.warning(
-                "Failed to process resource %s/%s data key={key}: %s",
+                "Failed to process resource %s/%s data key=%s: %s",
                 metadata.namespace,
                 metadata.name,
+                key,
                 e,
             )
     return changed
@@ -210,13 +217,22 @@ def invoke_webhook(metadata):
 
 class ConfigWatcher:
     def __init__(
-        self, resource, namespace, label_selector, request_timeout=60, watch_timeout=60
+        self,
+        resource,
+        namespace,
+        label_selector,
+        request_timeout=60,
+        watch_timeout=60,
+        retry=5,
+        retry_delay=5.0,
     ):
         self.resource = resource
         self.namespace = namespace
         self.label_selector = label_selector
         self.request_timeout = request_timeout
         self.watch_timeout = watch_timeout
+        self.retry = retry
+        self.retry_delay = retry_delay
         self.stopped = False
         self.watch = watch.Watch()
 
@@ -231,21 +247,31 @@ class ConfigWatcher:
                 )
                 self.do_watch()
             except ApiException as e:
-                LOGGER.warning("Kubernetes API server error: %s", e)
-                time.sleep(5)
+                if e.status != 500:
+                    LOGGER.warning("Kubernetes API server error: %s", e)
+                    self._check_retry_exhausted(e)
+                else:
+                    raise
             except UrlLibTimeoutError as e:
                 LOGGER.debug("Timeout while reading from API server: %s", e)
             except MaxRetryError as e:
-                LOGGER.error("Max retried exausted calling API server: %s", e)
+                # the request has been already retired by urllib3
+                LOGGER.error("Max retries exhausted calling API server: %s", e)
                 raise
             except HTTPError as e:
                 LOGGER.error("HTTP error while calling API server: %s", e)
-                raise
+                self._check_retry_exhausted(e)
 
     def stop(self):
         self.stopped = True
         if self.watch:
             self.watch.stop()
+
+    def _check_retry_exhausted(self, err):
+        if self.retry < 0:
+            raise err
+        self.retry -= 1
+        time.sleep(self.retry_delay)
 
     def do_watch(self):
         kwargs = {
@@ -299,16 +325,24 @@ class NamespaceWatcherThread(Thread):
         self.watcher.stop()
 
 
-def start_watchers(namespaces, exc_queue):
+def start_watchers(
+    namespaces,
+    exc_queue,
+    resource_type=RESOURCE_TYPE,
+    label_selector=LABEL_SELECTOR,
+    watch_timeout=int(WATCH_TIMEOUT),
+    retry=RETRY_COUNT,
+):
     threads = []
     for ns in namespaces:
         # Start a config watcher thread per namespace
         thread = NamespaceWatcherThread(
-            RESOURCE_TYPE,
+            resource_type,
             ns,
-            LABEL_SELECTOR,
+            label_selector,
             exc_queue,
-            watch_timeout=int(WATCH_TIMEOUT),
+            watch_timeout=watch_timeout,
+            retry=retry,
         )
         thread.start()
         threads.append(thread)
@@ -341,7 +375,14 @@ def stop_watchers(threads, timeout=5):
         t.join(0.1)
         if t.is_alive():
             threads.append(t)
-        if time.time() - start_time > timeout:
+        elapsed = time.time() - start_time
+        if elapsed > timeout:
+            if timeout > 0:
+                LOGGER.debug(
+                    "%d watcher threads still running after %.2fs",
+                    len(threads),
+                    elapsed,
+                )
             return
 
 

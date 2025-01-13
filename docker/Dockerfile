@@ -1,25 +1,32 @@
 FROM library/python:3.12-slim
 
-# Create nuodb user/group entries and home directory
-RUN echo "nuodb:x:1000:1000:nuodb user:/home/nuodb:/bin/bash" >> /etc/passwd \
-    && echo "nuodb:x:1000:" >> /etc/group \
-    && mkdir -p /home/nuodb \
-    && chown 1000:1000 /home/nuodb
+# Install runtime dependencies
+RUN set -ex; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+    libnss-wrapper \
+    ; \
+    rm -rf /var/lib/apt/lists/*
+
+# Setup nuodb user and copy files as nuodb user
+ENV NUODB_DEFAULT_UID 1000
+COPY docker/user_setup /usr/local/bin
+RUN user_setup
 
 # Create directory for each tool
 RUN mkdir /opt/config_watcher \
-    && chown 1000:1000 /opt/config_watcher
+    && chown 1000:0 /opt/config_watcher
 RUN mkdir /opt/nuodb-operations \
-    && chown 1000:1000 /opt/nuodb-operations
+    && chown 1000:0 /opt/nuodb-operations
 
 # Copy tools code as nuodb user
 USER 1000:1000
 
 # Copy sidecar scripts
-COPY --chown=1000:1000 config_watcher/requirements.txt /opt/config_watcher/requirements.txt
-COPY --chown=1000:1000 config_watcher/watcher.py /opt/config_watcher/watcher.py
-COPY --chown=1000:1000 nuodb-operations /opt/nuodb-operations
-COPY --chown=1000:1000 docker/entrypoint.sh /usr/local/bin/
+COPY --chown=1000:0 config_watcher/requirements.txt /opt/config_watcher/requirements.txt
+COPY --chown=1000:0 config_watcher/watcher.py /opt/config_watcher/watcher.py
+COPY --chown=1000:0 nuodb-operations /opt/nuodb-operations
+COPY --chown=1000:0 docker/entrypoint.sh /usr/local/bin/
 
 # Install tools requirements
 RUN pip3 install -r /opt/config_watcher/requirements.txt
