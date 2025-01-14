@@ -43,6 +43,7 @@ def retry(check_fn, timeout, initial_delay=0.25, max_delay=5):
             else:
                 raise
 
+
 def consistently(check_fn, timeout, initial_delay=0.25, max_delay=5):
     delay = initial_delay
     start_time = time.time()
