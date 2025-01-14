@@ -169,3 +169,13 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Temporary directories
+bin
+tmp
+
+# Test artifacts
+test-results
+
+# IDE specific files
+.vscode

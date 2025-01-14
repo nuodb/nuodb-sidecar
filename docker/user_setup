@@ -1,0 +1,42 @@
+#!/bin/sh
+#
+# (C) Copyright 2021-2025 Dassault Systemes SE.  All Rights Reserved
+
+set -ex
+
+: ${NUODB_DEFAULT_UID:=1000}
+
+setup_dir() {
+    mkdir -p -m "${2:-0770}" "$1"
+    chown "${NUODB_DEFAULT_UID}:0" "$1"
+    chmod "${2:-0770}" "$1"
+}
+
+setup_file() {
+    cat > "$1"
+    chown "${NUODB_DEFAULT_UID}:0" "$1"
+    chmod 0660 "$1"
+}
+
+# Create nuodb user and make a copy of /etc/passwd in case the container
+# runtime modifies it. Specifically, CRI-O automatically adds an entry to
+# /etc/passwd if the uid is not already present. Since we are using nss_wrapper
+# to support arbitrary uids in a way that is agnostic to the container runtime,
+# we do not want to keep the entry added by CRI-O.
+echo "nuodb:x:${NUODB_DEFAULT_UID}:0:nuodb user:/home/nuodb:/bin/bash" >> /etc/passwd
+cp /etc/passwd /etc/passwd.nuodb
+
+# Setup nuodb user directory and make the nuodb user owner of /usr/local/bin so
+# that it can add Docker-specific scripts and configs to it
+( setup_dir /home/nuodb     0770
+  setup_dir /usr/local/bin  0775
+  ) >/dev/null
+
+setup_file /home/nuodb/.bashrc <<"EOF"
+# Enable nss_wrapper if /tmp/passwd and /tmp/group exist
+if [ -f /tmp/passwd -a -f /tmp/group ]; then
+    export LD_PRELOAD=libnss_wrapper.so
+    export NSS_WRAPPER_PASSWD=/tmp/passwd
+    export NSS_WRAPPER_GROUP=/tmp/group
+fi
+EOF
