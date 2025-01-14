@@ -66,7 +66,7 @@ test-setup: $(KWOKCTL) $(KUBECTL) ## Run tests setup
 	mkdir -p $(TMP_DIR)
 	@[ ! -x "./config_watcher/test_setup.sh" ] || ./config_watcher/test_setup.sh
 
-test-teardown: $(KWOKCTL) ## Run tests tierdown
+test-teardown: $(KWOKCTL) ## Run tests teardown
 	@[ ! -x "./config_watcher/test_teardown.sh" ] || ./config_watcher/test_teardown.sh
 
 ##@ Build

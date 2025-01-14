@@ -4,7 +4,6 @@ import os
 import sys
 import logging
 from urllib.parse import urlparse
-from hashlib import sha256
 import base64
 import traceback
 import time
@@ -26,10 +25,7 @@ import requests
 from requests.adapters import HTTPAdapter
 
 LOG = os.environ.get("LOG", "INFO")
-log_level = getattr(logging, LOG.upper(), None)
-if not isinstance(log_level, int):
-    raise RuntimeError(f"Invalid log level: {log_level}")
-logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=LOG.upper(), format="%(asctime)s %(levelname)s %(message)s")
 LOGGER = logging.getLogger(__name__)
 
 RESOURCE_CONFIGMAP = "config_map"
@@ -130,24 +126,17 @@ def update_file(path, content, remove=False):
             os.remove(path)
             return True
         return False
-    mode = "w"
-    if isinstance(content, (bytes, bytearray)):
-        mode += "b"
+    if not isinstance(content, (bytes, bytearray)):
+        content = content.encode("utf-8")
 
-    # Compare with old file content by calculating SHA256 hash
+    # Compare with current file contents
     if os.path.isfile(path):
-        if "b" in mode:
-            hash_new = sha256(content)
-        else:
-            hash_new = sha256(content.encode("utf-8"))
         with open(path, "rb") as f:
-            hash_cur = sha256()
-            for byte_block in iter(lambda: f.read(4096), b""):
-                hash_cur.update(byte_block)
-        if hash_new.hexdigest() == hash_cur.hexdigest():
+            content_cur = f.read()
+        if content_cur == content:
             return False
 
-    with open(path, mode) as f:
+    with open(path, "wb") as f:
         # Write the content, flush buffers and invoke fsync() to make sure data
         # is written to disk
         f.write(content)

@@ -11,6 +11,7 @@ import random
 import time
 import http.server
 from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler
 import threading
 from subprocess import TimeoutExpired
 
@@ -41,6 +42,21 @@ def retry(check_fn, timeout, initial_delay=0.25, max_delay=5):
                 delay = min(max_delay, 2 * delay)
             else:
                 raise
+
+def consistently(check_fn, timeout, initial_delay=0.25, max_delay=5):
+    delay = initial_delay
+    start_time = time.time()
+    while True:
+        try:
+            result = check_fn()
+            remaining = timeout - (time.time() - start_time)
+            if remaining > 0:
+                time.sleep(max(initial_delay, min(remaining, delay)))
+                delay = min(max_delay, 2 * delay)
+            else:
+                return result
+        except Exception:
+            raise
 
 
 class WatcherTest(unittest.TestCase):
@@ -81,7 +97,7 @@ class WatcherTest(unittest.TestCase):
     def start_webhook_server(self):
         reqs = []
 
-        class MockWebhookHandler(http.server.BaseHTTPRequestHandler):
+        class MockWebhookHandler(BaseHTTPRequestHandler):
             def store_request(self):
                 payload = None
                 content_length = self.headers.get("Content-Length")
@@ -136,8 +152,8 @@ class WatcherTest(unittest.TestCase):
         try:
             returncode = self.watcher.wait(timeout=0.5)
             if not expect_error:
-                # check that process is alive
-                self.assertIsNone(returncode, f"Watcher failed [ret={returncode}]")
+                # watcher failed unexpectedly
+                self.fail(f"Watcher failed [ret={returncode}]")
             elif isinstance(expect_error, str):
                 # check the expected error string
                 out = self.watcher.stdout.read()
@@ -205,7 +221,7 @@ class WatcherTest(unittest.TestCase):
             return {self.TEST_LABEL_KEY: self.TEST_LABEL_VALUE, **extra_labels}
         return {self.TEST_LABEL_KEY: self.TEST_LABEL_VALUE}
 
-    def _get_configmap(self, name, namespace="default", data={}, extra_labels=None):
+    def _get_configmap(self, name, namespace="default", data=None, extra_labels=None):
         metadata = client.V1ObjectMeta(
             name=name, namespace=namespace, labels=self._get_labels(extra_labels)
         )
@@ -213,7 +229,7 @@ class WatcherTest(unittest.TestCase):
             api_version="v1", kind="ConfigMap", data=data, metadata=metadata
         )
 
-    def _get_secret(self, name, namespace="default", data={}, extra_labels=None):
+    def _get_secret(self, name, namespace="default", data=None, extra_labels=None):
         metadata = client.V1ObjectMeta(
             name=name, namespace=namespace, labels=self._get_labels(extra_labels)
         )
@@ -268,6 +284,9 @@ class WatcherTest(unittest.TestCase):
 
     def awaitFileNotExist(self, name, timeout=5):
         retry(lambda: self.assertFileNotExist(name), timeout)
+
+    def consistentlyFileNotExist(self, name, timeout=2):
+        consistently(lambda: self.assertFileNotExist(name), timeout)
 
     def _testFilesCreated(self, resource_type):
         # start watcher
@@ -394,8 +413,8 @@ class WatcherTest(unittest.TestCase):
         # verify that only files in cm2 and cm3 are created
         self.awaitFileContent("file2", "content2")
         self.awaitFileContent("file3", "content3")
-        self.awaitFileNotExist("file1")
-        self.awaitFileNotExist("file4")
+        self.consistentlyFileNotExist("file1")
+        self.consistentlyFileNotExist("file4")
 
     def _testWebhookInvoked(self, method="GET"):
         # start mock webhook server

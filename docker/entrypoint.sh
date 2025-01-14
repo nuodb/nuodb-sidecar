@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# (C) Copyright 2018-2023 Dassault Systemes SE.  All Rights Reserved.
+# (C) Copyright 2018-2025 Dassault Systemes SE.  All Rights Reserved.
 
 set -e
 

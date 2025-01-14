@@ -13,7 +13,6 @@ echo "Creating K8s cluster..."
 kwokctl create cluster --wait 1m
 
 CLUSTER_DIR="$KWOK_WORKDIR/clusters/kwok"
-DOCKER_NET="kwok-kwok"
 
 chmod -R a+X,a+r "$CLUSTER_DIR"
 
