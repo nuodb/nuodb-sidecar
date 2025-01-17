@@ -1,6 +1,6 @@
 # NuoDB sidecar container image
 
-![Build status](https://github.com/nuodb/nuodb-sidecar/actions/workflows/test/badge.svg)
+![Build status](https://github.com/nuodb/nuodb-sidecar/actions/workflows/test.yaml/badge.svg)
 
 The NuoDB sidecar container image bundles additional tools which help running NuoDB database in Kubernetes cluster.
 
