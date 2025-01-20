@@ -39,4 +39,7 @@ if [ -f /tmp/passwd -a -f /tmp/group ]; then
     export NSS_WRAPPER_PASSWD=/tmp/passwd
     export NSS_WRAPPER_GROUP=/tmp/group
 fi
+
+# Enable tab completion for nuocmd
+. "$NUOCLIENT_HOME/etc/nuocmd-complete"
 EOF

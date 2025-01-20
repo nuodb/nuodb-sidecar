@@ -35,6 +35,9 @@ case "${uid}:${gid}" in
         ;;
 esac
 
+# Add NuoDB client in PATH
+export PATH="$NUOCLIENT_HOME/bin:$PATH"
+
 # Support well-known commands
 case "$1" in
     (config_watcher)
