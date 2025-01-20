@@ -45,11 +45,11 @@ WEBHOOK_TIMEOUT = os.environ.get("WEBHOOK_TIMEOUT", "60")
 WEBHOOK_VERIFY = os.environ.get("WEBHOOK_VERIFY", "true")
 
 NAMESPACE_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
-RETRY_COUNT = 5
+RETRY_COUNT = os.environ.get("RETRY_COUNT", "5")
 DEFAULT_RETRIES = Retry(
-    connect=RETRY_COUNT,
-    read=RETRY_COUNT,
-    total=RETRY_COUNT,
+    connect=int(RETRY_COUNT),
+    read=int(RETRY_COUNT),
+    total=int(RETRY_COUNT),
     backoff_factor=0.5,
 )
 
@@ -320,7 +320,7 @@ def start_watchers(
     resource_type=RESOURCE_TYPE,
     label_selector=LABEL_SELECTOR,
     watch_timeout=int(WATCH_TIMEOUT),
-    retry=RETRY_COUNT,
+    retry=int(RETRY_COUNT),
 ):
     threads = []
     for ns in namespaces:
