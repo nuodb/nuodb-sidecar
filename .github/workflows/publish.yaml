@@ -16,6 +16,9 @@ jobs:
     name: Publish Docker Image to GitHub Packages
     needs: test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -40,4 +43,4 @@ jobs:
           IMG_TAG: ${{ join(fromJSON(steps.meta.outputs.json).tags, ' ') }}
           PUSH_REPO: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
         run: |
-          yes | make docker-build
+          echo "yes" | make docker-build

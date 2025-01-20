@@ -37,7 +37,7 @@ if [ "$GIT_STATUS" = "" ]; then
 fi
 
 # Use PUSH_REPO to specify remote Docker repo to publish to
-if [ "$PUSH_REPO" != "" ] && [ "$(read -p "Push image to \"$PUSH_REPO\" with tag \"$MAIN_TAG\" (yes/no)? " && echo "$REPLY")" = "yes" ]; then
+if [ "$PUSH_REPO" != "" ] && [ "$(read -p "Push image to \"$PUSH_REPO\" with tag \"$MAIN_TAG\" (yes/no)? " REPLY && echo "$REPLY")" = "yes" ]; then
     # Make sure there are no uncommitted changes
     [ "$GIT_STATUS" = "" ] || fail "Cannot push image with uncommitted changes:\n$GIT_STATUS"
 
