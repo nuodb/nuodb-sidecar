@@ -36,9 +36,9 @@ NuoDB sidecar is used in [Database](https://github.com/nuodb/nuodb-helm-charts/t
 
 ### Development environment
 
-To develop and test the tools localy, follow below steps.
+To develop and test the tools locally, follow below steps.
 
-- Create Python virtual environment with IDE or by running:
+- Create Python virtual environment with an IDE or by running:
 
 ```sh
 python3 -m venv .venv

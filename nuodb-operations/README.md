@@ -2,12 +2,12 @@
 
 An HTTP server that allows remote operations on NuoDB engine containers.
 
-## Feature
+## Features
 
-- Pre-post backup hooks for snapshot-based NuoDB backup
+- _Pre_ and _post_ backup hooks for snapshot-based NuoDB backup
 - Support for custom scripts to be invoked on HTTP requests
 
-## Confugration
+## Configuration
 
 ### Sidecar configuration
 

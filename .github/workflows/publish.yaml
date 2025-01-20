@@ -37,7 +37,7 @@ jobs:
       - name: Build and push Docker image to GHCR
         env:
           IMG_REPO: ${{ env.IMAGE_NAME }}
-          IMG_TAG: ${{ join(fromJSON(steps.meta.outputs.json).tags, ';') }}
+          IMG_TAG: ${{ join(fromJSON(steps.meta.outputs.json).tags, ' ') }}
           PUSH_REPO: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
         run: |
-          make docker-build
+          yes | make docker-build

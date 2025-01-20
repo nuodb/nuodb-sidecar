@@ -4,13 +4,13 @@ This is an application that watches for changes on `ConfigMap` or `Secret` resou
 An optional HTTP/s webhook URL is executed on a resource change.
 The main purpose of the config watcher is to run as a sidecar for applications that need their configuration to be updated dynamically from the Kubernetes cluster state.
 
-## Feature
+## Features
 
 - Create, update, and delete files from `ConfigMap` or `Secret` resource `data` field.
 - Execute optional HTTP/s webhook URL on resource change
 - Multi-namespace support
 
-## Confugration
+## Configuration
 
 ### Kubernetes API server
 

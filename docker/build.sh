@@ -22,16 +22,14 @@ GIT_STATUS="$(git status --porcelain)"
 : ${IMG_TAG:="latest"}
 
 # Extract the first image tag
-MAIN_TAG="${IMG_TAG%%;*}"
+MAIN_TAG="$(echo "$IMG_TAG" | awk '{print $1}')"
 
 docker build -f ./docker/Dockerfile . --tag "$IMG_REPO:$MAIN_TAG" --label org.opencontainers.image.revision="$COMMIT"
 
 # Also tag the image with other tags if specified
-IFS=';'
 for tag in $IMG_TAG; do
     docker tag "$IMG_REPO:$MAIN_TAG" "$IMG_REPO:$tag"
 done
-unset IFS
 
 # Also tag image with commit SHA if there are no uncommitted changes
 if [ "$GIT_STATUS" = "" ]; then
@@ -39,17 +37,15 @@ if [ "$GIT_STATUS" = "" ]; then
 fi
 
 # Use PUSH_REPO to specify remote Docker repo to publish to
-if [ "$PUSH_REPO" != "" ]; then
+if [ "$PUSH_REPO" != "" ] && [ "$(read -p "Push image to \"$PUSH_REPO\" with tag \"$MAIN_TAG\" (yes/no)? " && echo "$REPLY")" = "yes" ]; then
     # Make sure there are no uncommitted changes
     [ "$GIT_STATUS" = "" ] || fail "Cannot push image with uncommitted changes:\n$GIT_STATUS"
 
     # Tag the image with other tags if specified
-    IFS=';'
     for tag in $IMG_TAG; do
         docker tag "$IMG_REPO:$MAIN_TAG" "$PUSH_REPO:$tag"
         docker push "$PUSH_REPO:$tag"
     done
-    unset IFS
 
     # Also tag image with commit SHA
     docker tag "$IMG_REPO:$MAIN_TAG" "$PUSH_REPO:sha-$COMMIT"
