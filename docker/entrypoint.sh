@@ -15,19 +15,22 @@ gid="$(id -g)"
 case "${uid}:${gid}" in
     (0:0|"$NUODB_DEFAULT_UID":0) : ;;
     (*:0|"$NUODB_DEFAULT_UID":*)
-        # Replace uid:gid for nuodb user
-        sed "s/^nuodb:x:${NUODB_DEFAULT_UID}:0:/nuodb:x:${uid}:${gid}:/" /etc/passwd.nuodb > /tmp/passwd
+        # Check if /tmp is writable
+        if test -w /tmp/passwd; then
+            # Replace uid:gid for nuodb user
+            sed "s/^nuodb:x:${NUODB_DEFAULT_UID}:0:/nuodb:x:${uid}:${gid}:/" /etc/passwd.nuodb > /tmp/passwd
 
-        # Copy /etc/group and add nuodb group if necessary
-        cp /etc/group /tmp/group
-        if [ "$gid" != 0 ]; then
-            echo "nuodb:x:${gid}:" >> /tmp/group
+            # Copy /etc/group and add nuodb group if necessary
+            cp /etc/group /tmp/group
+            if [ "$gid" != 0 ]; then
+                echo "nuodb:x:${gid}:" >> /tmp/group
+            fi
+
+            # Enable nss_wrapper
+            export LD_PRELOAD=libnss_wrapper.so
+            export NSS_WRAPPER_PASSWD=/tmp/passwd
+            export NSS_WRAPPER_GROUP=/tmp/group
         fi
-
-        # Enable nss_wrapper
-        export LD_PRELOAD=libnss_wrapper.so
-        export NSS_WRAPPER_PASSWD=/tmp/passwd
-        export NSS_WRAPPER_GROUP=/tmp/group
         ;;
     (*)
         echo "ERROR: Unexpected user and group ID: ${uid}:${gid}"
