@@ -16,7 +16,7 @@ case "${uid}:${gid}" in
     (0:0|"$NUODB_DEFAULT_UID":0) : ;;
     (*:0|"$NUODB_DEFAULT_UID":*)
         # Check if /tmp is writable
-        if test -w /tmp/passwd; then
+        if touch /tmp/passwd 2>/dev/null; then
             # Replace uid:gid for nuodb user
             sed "s/^nuodb:x:${NUODB_DEFAULT_UID}:0:/nuodb:x:${uid}:${gid}:/" /etc/passwd.nuodb > /tmp/passwd
 
