@@ -38,6 +38,9 @@ case "${uid}:${gid}" in
         ;;
 esac
 
+# Configure shell
+. /home/nuodb/.profile
+
 # Support well-known commands
 case "$1" in
     (config_watcher)
