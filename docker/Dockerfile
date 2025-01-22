@@ -1,6 +1,6 @@
 FROM library/python:3.12-slim
 
-ARG PYNUOADMIN_VERSION=2.4.0
+ARG PYNUOADMIN_VERSION=2.5.0
 
 # Install runtime dependencies
 RUN set -ex; \
