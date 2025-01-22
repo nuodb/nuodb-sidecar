@@ -32,11 +32,21 @@ cp /etc/passwd /etc/passwd.nuodb
   setup_dir /usr/local/bin  0775
   ) >/dev/null
 
-setup_file /home/nuodb/.bashrc <<"EOF"
+setup_file /home/nuodb/.profile <<"EOF"
 # Enable nss_wrapper if /tmp/passwd and /tmp/group exist
 if [ -f /tmp/passwd -a -f /tmp/group ]; then
     export LD_PRELOAD=libnss_wrapper.so
     export NSS_WRAPPER_PASSWD=/tmp/passwd
     export NSS_WRAPPER_GROUP=/tmp/group
 fi
+
+# Add nuocmd to the PATH
+export PATH=/home/nuodb/.local/bin:$PATH
+EOF
+
+setup_file /home/nuodb/.bashrc <<"EOF"
+[ -f /home/nuodb/.profile ] && . /home/nuodb/.profile
+
+# Enable tab completion for nuocmd
+. "/home/nuodb/.local/etc/nuocmd-complete"
 EOF
