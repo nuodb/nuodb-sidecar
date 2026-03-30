@@ -4,6 +4,7 @@ OUTPUT_DIR ?= $(PROJECT_DIR)/test-results
 export TMP_DIR ?= $(OUTPUT_DIR)/tmp
 export PATH := $(BIN_DIR):$(PATH)
 export KUBECONFIG ?= $(TMP_DIR)/kubeconfig.yaml
+export PYTHONPATH := $(BIN_DIR)/python-libs
 
 OS := $(shell go env GOOS)
 ARCH := $(shell go env GOARCH)
@@ -23,8 +24,8 @@ IMG_TAG ?= latest
 # Python linter
 PYLINT = python3 -m pylint
 PYLINTFLAGS = -rn
-PYTHONFILES := $(shell find $(PROJECT_DIR) -type f -name "*.py" -not -path "$(PROJECT_DIR)/.*/*" -not -path "*/test_*.py")
-PYTHONTESTFILES := $(shell find $(PROJECT_DIR) -type f -name "test_*.py" -not -path "$(PROJECT_DIR)/.*/*")
+PYTHONFILES := $(shell find $(PROJECT_DIR) -type f -name "*.py" -not -path "$(PROJECT_DIR)/.*/*" -not -path "*/test_*.py" -not -path "$(BIN_DIR)/*")
+PYTHONTESTFILES := $(shell find $(PROJECT_DIR) -type f -name "test_*.py" -not -path "$(PROJECT_DIR)/.*/*" -not -path "$(BIN_DIR)/*")
 
 ##@ General
 
@@ -46,20 +47,20 @@ help: ## Display this help.
 ##@ Development
 
 .PHONY: lint
-lint: $(patsubst %.py,%.pylint,$(PYTHONFILES)) ## Lint Python files
+lint: python-libs $(patsubst %.py,%.pylint,$(PYTHONFILES)) ## Lint Python files
 
 .PHONY: fmt ## Format Python files
-fmt:
-	python3 -m black --quiet $(PYTHONFILES) $(PYTHONTESTFILES)
+fmt: python-libs
+	PYTHONPATH=$(PYTHONPATH) python3 -m black --quiet $(PYTHONFILES) $(PYTHONTESTFILES)
 
 ##@ Testing
 
 .PHONY: test
 test: test-nuodb-operations test-config-watcher ## Run tests
 
-test-config-watcher: test-setup
+test-config-watcher: test-setup python-libs
 	cd config_watcher \
-		&& python3 -m pytest \
+		&& PYTHONPATH=$(PYTHONPATH) python3 -m pytest \
 			--junitxml $(OUTPUT_DIR)/reports/config_watcher.xml
 
 test-nuodb-operations:
@@ -80,6 +81,10 @@ test-teardown: $(KWOKCTL) ## Run tests teardown
 docker-build: ## Build NuoDB sidecar docker image.
 	IMG_REPO="$(IMG_REPO)" IMG_TAG="$(IMG_TAG)" ./docker/build.sh
 
+.PHONY: python-libs
+python-libs: ## Download python dependencies
+	pip3 install -r nuodb-operations/test-requirements.txt -r config_watcher/test-requirements.txt -r config_watcher/requirements.txt --upgrade  -t $(PYTHONPATH)
+
 $(KUBECTL):
 	mkdir -p bin
 	curl -L -s https://dl.k8s.io/release/v$(KUBECTL_VERSION)/bin/$(OS)/$(ARCH)/kubectl -o $(KUBECTL)
@@ -91,4 +96,4 @@ $(KWOKCTL):
 	chmod +x $(KWOKCTL)
 
 %.pylint:
-	$(PYLINT) $(PYLINTFLAGS) $*.py
+	PYTHONPATH=$(PYTHONPATH) $(PYLINT) $(PYLINTFLAGS) $*.py

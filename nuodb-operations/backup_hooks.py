@@ -446,7 +446,7 @@ def create_error(exc):
     return http.HTTPStatus.INTERNAL_SERVER_ERROR, dict(success=False, message=str(exc))
 
 
-REGISTERED_HANDLERS = [
+ARCHIVE_HANDLERS = [
     ("POST", "pre-backup", pre_backup),
     ("POST", "post-backup", post_backup),
     ("GET", "metrics", lambda: REGISTRY.collect()),  # pylint: disable=W0108
@@ -480,6 +480,11 @@ def get_query_params(query_str):
 
 def normalize_path(path):
     return path[1:] if path.startswith("/") else path
+
+
+def has_archives():
+    """Check if there is an archive configured on the container."""
+    return "NUODB_ARCHIVE_DIR" in os.environ
 
 
 class ScriptHandler(object):
@@ -595,36 +600,39 @@ class RequestInfo(object):  # pylint: disable=too-few-public-methods
 
 def handle_method(req):
     # Find a handler that matches the request
-    for method, path_prefix, handler in REGISTERED_HANDLERS:
-        if req.method == method and req.components[0] == path_prefix:
-            # Make sure the correct number of parameters were supplied by
-            # inspecting method signature
-            args = req.components[1:]
-            pos_args = inspect.getfullargspec(handler).args
-            # If `payload` is in the method signature, then read the request
-            # payload as JSON and pass it at the corresponding index
-            if "payload" in pos_args:
-                try:
-                    decoded_payload = json.loads(req.payload) if req.payload else None
-                    args.insert(pos_args.index("payload"), decoded_payload)
-                except json.JSONDecodeError as e:
-                    raise UserError(  # pylint: disable=raise-missing-from
-                        "Unable to decode request payload: " + str(e)
+    if has_archives():
+        for method, path_prefix, handler in ARCHIVE_HANDLERS:
+            if req.method == method and req.components[0] == path_prefix:
+                # Make sure the correct number of parameters were supplied by
+                # inspecting method signature
+                args = req.components[1:]
+                pos_args = inspect.getfullargspec(handler).args
+                # If `payload` is in the method signature, then read the request
+                # payload as JSON and pass it at the corresponding index
+                if "payload" in pos_args:
+                    try:
+                        decoded_payload = (
+                            json.loads(req.payload) if req.payload else None
+                        )
+                        args.insert(pos_args.index("payload"), decoded_payload)
+                    except json.JSONDecodeError as e:
+                        raise UserError(  # pylint: disable=raise-missing-from
+                            "Unable to decode request payload: " + str(e)
+                        )
+                # If `query` is in the method signature, then parse the query
+                # parameters as a dictionary and pass them at the corresponding
+                # index
+                if "query" in pos_args:
+                    args.insert(pos_args.index("query"), req.query_params)
+                if len(args) != len(pos_args):
+                    msg = "{} parameter(s) expected but {} supplied in request {}".format(
+                        len(pos_args), len(args), req.parsed.path
                     )
-            # If `query` is in the method signature, then parse the query
-            # parameters as a dictionary and pass them at the corresponding
-            # index
-            if "query" in pos_args:
-                args.insert(pos_args.index("query"), req.query_params)
-            if len(args) != len(pos_args):
-                msg = "{} parameter(s) expected but {} supplied in request {}".format(
-                    len(pos_args), len(args), req.parsed.path
-                )
-                if "payload" in pos_args or "query" in pos_args:
-                    msg += ", including payload and query parameters"
-                raise UserError(msg)
-            # Request is valid. Send it to handler.
-            return path_prefix, handler(*args)
+                    if "payload" in pos_args or "query" in pos_args:
+                        msg += ", including payload and query parameters"
+                    raise UserError(msg)
+                # Request is valid. Send it to handler.
+                return path_prefix, handler(*args)
 
     # Handler was not found
     raise UserError("No handler found for path " + req.parsed.path)
@@ -664,15 +672,21 @@ class HooksHandler(object):
     def log_handlers(self, indent=4):
         # Log all built-in handlers
         builtin_handlers = []
-        for method, path_prefix, handler in REGISTERED_HANDLERS:
-            path = path_prefix
-            for arg in inspect.getfullargspec(handler).args:
-                if arg not in ["payload", "query"]:
-                    path += "/{" + arg + "}"
-            builtin_handlers.append(
-                "{}{} /{}".format(indent * " ", method, normalize_path(path))
+        if has_archives():
+            for method, path_prefix, handler in ARCHIVE_HANDLERS:
+                path = path_prefix
+                for arg in inspect.getfullargspec(handler).args:
+                    if arg not in ["payload", "query"]:
+                        path += "/{" + arg + "}"
+                builtin_handlers.append(
+                    "{}{} /{}".format(indent * " ", method, normalize_path(path))
+                )
+        else:
+            LOGGER.warning(
+                "No archive dir found, not configuring certain built-in handlers."
             )
-        LOGGER.info("Built-in handlers:\n%s", "\n".join(builtin_handlers))
+        if builtin_handlers:
+            LOGGER.info("Built-in handlers:\n%s", "\n".join(builtin_handlers))
         # Log all custom handlers, if there are any
         custom_handlers = []
         for handler in self.handlers:

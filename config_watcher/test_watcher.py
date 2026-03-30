@@ -148,10 +148,12 @@ class WatcherTest(unittest.TestCase):
         kwargs["env"].setdefault("LABEL_SELECTOR", self.TEST_LABEL_KEY)
         kwargs["env"].setdefault("TARGET_DIRECTORY", self.test_dir)
         kwargs["env"].setdefault("LOG", "DEBUG")
+        if "PYTHONPATH" in os.environ:
+            kwargs["env"].setdefault("PYTHONPATH", os.environ["PYTHONPATH"])
         self.watcher = self.startcmd(sys.executable, watcher_script, *args, **kwargs)
 
         try:
-            returncode = self.watcher.wait(timeout=0.5)
+            returncode = self.watcher.wait(timeout=5)
             if not expect_error:
                 # watcher failed unexpectedly
                 self.fail(f"Watcher failed [ret={returncode}]")
