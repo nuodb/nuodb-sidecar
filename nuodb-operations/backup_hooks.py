@@ -12,7 +12,9 @@ import urllib
 import wsgiref
 from wsgiref import simple_server
 from threading import Timer
-from shutil import which
+from shutil import which, disk_usage
+
+from metrics import Gauge, Histogram, REGISTRY
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 LOGGER = logging.getLogger(__name__)
@@ -38,6 +40,29 @@ JOURNAL_BACKUP_ID_FILE = from_dir(JOURNAL_DIR, "backup.txt")
 BACKUP_PAYLOAD_FILE = from_dir(ARCHIVE_DIR, "backup_payload.txt")
 BACKUP_START_ID_FILE = from_dir(ARCHIVE_DIR, "backup_sid.txt")
 RESTORED_FILE = from_dir(ARCHIVE_DIR, "restored.txt")
+
+VOLUME_AVAILABLE_BYTES = Gauge(
+    "nuodb_volume_available_bytes",
+    description="Database volume available bytes.",
+    label_names=["volume"],
+)
+
+ARCHIVE_FROZEN_SECONDS = Histogram(
+    "nuodb_archive_frozen_seconds",
+    description="Length of time for which the NuoDB archive was frozen.",
+    # fmt: off
+    buckets=[
+        0.5, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5,
+        5, 6, 7, 8, 9, 10, 15, 20, 25, 30, 40, 50, 60, 70, 100, 120, 140, 160, 200, 250,
+    ],
+    # fmt: on
+)
+
+HOOK_REQUEST_DURATION_SECONDS = Histogram(
+    "hook_request_duration_seconds",
+    description="Total count of database archive freeze operations.",
+    label_names=["method", "endpoint", "http_status"],
+)
 
 
 def write_file(path, content):
@@ -325,6 +350,9 @@ def post_backup(backup_id, query):
     if JOURNAL_DIR is not None:
         try:
             freeze_archive(backup_id, processes, unfreeze=True)
+            ctime = get_backup_ctime()
+            if ctime:
+                ARCHIVE_FROZEN_SECONDS.observe(time.time() - ctime)
         except ArchivingNotPausedError:
             # Delete backup metadata files to allow new backups
             remove_backup_files()
@@ -349,6 +377,11 @@ def get_backup_id():
     if os.path.exists(ARCHIVE_BACKUP_ID_FILE):
         with open(ARCHIVE_BACKUP_ID_FILE, "r") as f:
             return f.read().strip()
+
+
+def get_backup_ctime():
+    if os.path.exists(ARCHIVE_BACKUP_ID_FILE):
+        return os.path.getctime(ARCHIVE_BACKUP_ID_FILE)
 
 
 def get_start_id():
@@ -410,6 +443,7 @@ def create_error(exc):
 REGISTERED_HANDLERS = [
     ("POST", "pre-backup", pre_backup),
     ("POST", "post-backup", post_backup),
+    ("GET", "metrics", lambda: REGISTRY.collect()),  # pylint: disable=W0108
 ]
 
 
@@ -584,8 +618,7 @@ def handle_method(req):
                     msg += ", including payload and query parameters"
                 raise UserError(msg)
             # Request is valid. Send it to handler.
-            handler(*args)
-            return
+            return path_prefix, handler(*args)
 
     # Handler was not found
     raise UserError("No handler found for path " + req.parsed.path)
@@ -638,18 +671,30 @@ class HooksHandler(object):
             LOGGER.info("Custom handlers:\n%s", "\n".join(custom_handlers))
 
     def handle(self, environ):
+        req = RequestInfo(environ)
+        start_time = time.time()
+        status = http.HTTPStatus.OK
+        path = f"/{'/'.join(req.components)}"
         try:
             # Dispatch to matching script handler
-            req = RequestInfo(environ)
             for handler in self.handlers:
                 matches, path_params = handler.matches(req.method, req.components)
                 if matches:
+                    path = handler.path
                     return handler.execute(path_params, req.query_params, req.payload)
             # Dispatch to matching built-in handler
-            handle_method(req)
-            return http.HTTPStatus.OK, dict(success=True)
+            path, resp_data = handle_method(req)
+            if resp_data is None:
+                # Return a trivial JSON response indicating success
+                resp_data = dict(success=True)
+            return status, resp_data
         except Exception as e:
-            return create_error(e)
+            status, data = create_error(e)
+            return status, data
+        finally:
+            HOOK_REQUEST_DURATION_SECONDS.labels(req.method, path, str(status)).observe(
+                time.time() - start_time
+            )
 
     def __call__(self, environ, start_response):
         status, json_response = self.handle(environ)
@@ -658,6 +703,14 @@ class HooksHandler(object):
 
 def start_server(port, handler_config):
     hooks_handler = HooksHandler(handler_config)
+    # Register metric functions
+    VOLUME_AVAILABLE_BYTES.labels("archive-volume").set_function(
+        lambda: disk_usage(ARCHIVE_DIR)[2]
+    )
+    if JOURNAL_DIR:
+        VOLUME_AVAILABLE_BYTES.labels("journal-volume").set_function(
+            lambda: disk_usage(JOURNAL_DIR)[2]
+        )
     with simple_server.make_server("", port, hooks_handler) as httpd:
         LOGGER.info("Starting backup hooks server on port %s", port)
         httpd.serve_forever()
