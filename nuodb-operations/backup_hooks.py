@@ -47,9 +47,9 @@ VOLUME_AVAILABLE_BYTES = Gauge(
     label_names=["volume"],
 )
 
-ARCHIVE_FROZEN_SECONDS = Histogram(
-    "nuodb_archive_frozen_seconds",
-    description="Length of time for which the NuoDB archive was frozen.",
+BACKUP_DURATION_SECONDS = Histogram(
+    "snapshot_backup_duration_seconds",
+    description="Length of time for taking snapshot-based backup.",
     # fmt: off
     buckets=[
         0.5, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5,
@@ -340,6 +340,8 @@ def post_backup(backup_id, query):
         else:
             raise UserError(msg)
 
+    # Get backup file creation timestamp
+    ctime = get_backup_ctime()
     # Get nuodb processes
     processes = get_nuodb_process_info()
     if not processes:
@@ -350,16 +352,20 @@ def post_backup(backup_id, query):
     if JOURNAL_DIR is not None:
         try:
             freeze_archive(backup_id, processes, unfreeze=True)
-            ctime = get_backup_ctime()
-            if ctime:
-                ARCHIVE_FROZEN_SECONDS.observe(time.time() - ctime)
         except ArchivingNotPausedError:
             # Delete backup metadata files to allow new backups
             remove_backup_files()
+            # Record the snapshot duration even if the database archiving was
+            # already resumed due to internal engine timeout
+            if ctime:
+                BACKUP_DURATION_SECONDS.observe(time.time() - ctime)
             raise
 
     # Delete backup metadata files
     remove_backup_files()
+    # Record the total duration of the snapshot operation
+    if ctime:
+        BACKUP_DURATION_SECONDS.observe(time.time() - ctime)
 
 
 def remove_backup_files():

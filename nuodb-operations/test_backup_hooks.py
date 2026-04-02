@@ -15,8 +15,8 @@ from http.client import HTTPConnection
 from threading import Thread
 from wsgiref.simple_server import make_server
 
-import backup_hooks
 import metrics
+import backup_hooks
 from backup_hooks import HooksHandler, LOGGER
 
 LOGGER.setLevel(logging.DEBUG)
@@ -99,8 +99,8 @@ class BackupHooksTest(unittest.TestCase):
             with open(handler_config, "w") as f:
                 f.write(json.dumps(dict(handlers=custom_handlers)))
         # Reload ensures that env changes are picked up and metrics are reset
-        importlib.reload(backup_hooks)
         importlib.reload(metrics)
+        importlib.reload(backup_hooks)
         # Mock functions
         self.mock_functions()
         return handler_config
@@ -279,9 +279,7 @@ class BackupHooksTest(unittest.TestCase):
             }
         ]
     )
-    def testVolumeMetrics(self):
-        external_journal = self.get_server_config().get("external_journal", False)
-
+    def testMetrics(self):
         # request metrics endpoint
         resp, data = self.request(method="GET", path="/metrics")
         self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
@@ -307,47 +305,46 @@ class BackupHooksTest(unittest.TestCase):
 
         # verify that hook request latency Histogram is emitted
         self.assertIn(
-            'hook_request_duration_seconds_bucket{le="1.0", method="GET", endpoint="/metrics", http_status="200"} 1',
+            'hook_request_duration_seconds_bucket{le="1.0",method="GET",endpoint="/metrics",http_status="200"} 1',
             out,
         )
         self.assertIn(
-            'hook_request_duration_seconds_bucket{le="+Inf", method="GET", endpoint="/metrics", http_status="200"} 1',
+            'hook_request_duration_seconds_bucket{le="+Inf",method="GET",endpoint="/metrics",http_status="200"} 1',
             out,
         )
         self.assertIn(
-            'hook_request_duration_seconds_bucket{le="+Inf", method="GET", endpoint="/metrics", http_status="200"} 1',
+            'hook_request_duration_seconds_bucket{le="+Inf",method="GET",endpoint="/metrics",http_status="200"} 1',
             out,
         )
         self.assertIn(
-            'hook_request_duration_seconds_count{method="GET", endpoint="/metrics", http_status="200"} 1',
+            'hook_request_duration_seconds_count{method="GET",endpoint="/metrics",http_status="200"} 1',
             out,
         )
         self.assertIn(
-            'hook_request_duration_seconds_sum{method="GET", endpoint="/metrics", http_status="200"}',
+            'hook_request_duration_seconds_sum{method="GET",endpoint="/metrics",http_status="200"}',
             out,
         )
 
-        if external_journal:
-            # call backup hooks
-            backup_id = str(uuid.uuid4())
-            self.pre_backup(backup_id)
-            time.sleep(2.5)
-            self.post_backup(backup_id)
+        # call backup hooks
+        backup_id = str(uuid.uuid4())
+        resp, data = self.pre_backup(backup_id)
+        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+        time.sleep(0.6)
+        resp, data = self.post_backup(backup_id)
+        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
 
-            # request metrics endpoint again
-            resp, data = self.request(method="GET", path="/metrics")
-            self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
-            out = data.decode("utf-8")
+        # request metrics endpoint again
+        resp, data = self.request(method="GET", path="/metrics")
+        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+        out = data.decode("utf-8")
 
-            # verify that nuodb_archive_frozen_seconds Histogram is emitted
-            self.assertIn('nuodb_archive_frozen_seconds_bucket{le="1.0"} 0', out)
-            self.assertIn('nuodb_archive_frozen_seconds_bucket{le="2.0"} 0', out)
-            self.assertIn('nuodb_archive_frozen_seconds_bucket{le="3.0"} 1', out)
-            self.assertIn('nuodb_archive_frozen_seconds_bucket{le="4.0"} 1', out)
-            self.assertIn('nuodb_archive_frozen_seconds_bucket{le="+Inf"} 1', out)
-            # TODO(siv3): figure out why fails
-            # self.assertIn("nuodb_archive_frozen_seconds_count 1", out)
-            # self.assertIn('nuodb_archive_frozen_seconds_sum', out)
+        # verify that nuodb_archive_frozen_seconds Histogram is emitted
+        self.assertIn('snapshot_backup_duration_seconds_bucket{le="0.5"} 0', out)
+        self.assertIn('snapshot_backup_duration_seconds_bucket{le="1.0"} 1', out)
+        self.assertIn('snapshot_backup_duration_seconds_bucket{le="+Inf"} 1', out)
+        self.assertIn("snapshot_backup_duration_seconds_count 1", out)
+        self.assertIn("snapshot_backup_duration_seconds_sum", out)
+        self.assertNotIn("snapshot_backup_duration_seconds 0", out)
 
         # request custom handler
         resp, data = self.request(method="GET", path="/exit")
@@ -364,39 +361,39 @@ class BackupHooksTest(unittest.TestCase):
 
         # verify that hook request latency Histogram is emitted
         self.assertIn(
-            'hook_request_duration_seconds_bucket{le="+Inf", method="GET", endpoint="/exit", http_status="200"} 1',
+            'hook_request_duration_seconds_bucket{le="+Inf",method="GET",endpoint="/exit",http_status="200"} 1',
             out,
         )
         self.assertIn(
-            'hook_request_duration_seconds_count{method="GET", endpoint="/exit", http_status="200"} 1',
+            'hook_request_duration_seconds_count{method="GET",endpoint="/exit",http_status="200"} 1',
             out,
         )
         self.assertIn(
-            'hook_request_duration_seconds_sum{method="GET", endpoint="/exit", http_status="200"}',
+            'hook_request_duration_seconds_sum{method="GET",endpoint="/exit",http_status="200"}',
             out,
         )
         self.assertIn(
-            'hook_request_duration_seconds_bucket{le="+Inf", method="GET", endpoint="/exit", http_status="500"} 1',
+            'hook_request_duration_seconds_bucket{le="+Inf",method="GET",endpoint="/exit",http_status="500"} 1',
             out,
         )
         self.assertIn(
-            'hook_request_duration_seconds_count{method="GET", endpoint="/exit", http_status="500"} 1',
+            'hook_request_duration_seconds_count{method="GET",endpoint="/exit",http_status="500"} 1',
             out,
         )
         self.assertIn(
-            'hook_request_duration_seconds_sum{method="GET", endpoint="/exit", http_status="500"}',
+            'hook_request_duration_seconds_sum{method="GET",endpoint="/exit",http_status="500"}',
             out,
         )
         self.assertIn(
-            'hook_request_duration_seconds_bucket{le="+Inf", method="GET", endpoint="/exit", http_status="400"} 1',
+            'hook_request_duration_seconds_bucket{le="+Inf",method="GET",endpoint="/exit",http_status="400"} 1',
             out,
         )
         self.assertIn(
-            'hook_request_duration_seconds_count{method="GET", endpoint="/exit", http_status="400"} 1',
+            'hook_request_duration_seconds_count{method="GET",endpoint="/exit",http_status="400"} 1',
             out,
         )
         self.assertIn(
-            'hook_request_duration_seconds_sum{method="GET", endpoint="/exit", http_status="400"}',
+            'hook_request_duration_seconds_sum{method="GET",endpoint="/exit",http_status="400"}',
             out,
         )
 

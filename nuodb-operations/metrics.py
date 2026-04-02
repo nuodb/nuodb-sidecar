@@ -9,16 +9,17 @@ LOGGER = logging.getLogger(__name__)
 class MetricRegistry(object):
     def __init__(self):
         self._lock = threading.Lock()
-        self._metrics = []
+        self._metrics = {}
 
     def register(self, metric):
         with self._lock:
-            self._metrics += [metric]
+            if metric.name not in self._metrics:
+                self._metrics[metric.name] = metric
 
     def collect(self):
         with self._lock:
             lines = []
-            for m in self._metrics:
+            for m in self._metrics.values():
                 l = m.describe()
                 if l:
                     lines += l
@@ -95,6 +96,8 @@ class Metric(object):
             return "+Inf"
         if v is NaN:
             return "NaN"
+        if v is None:
+            return "NaN"
         return v
 
     @staticmethod
@@ -112,12 +115,11 @@ class Metric(object):
             try:
                 v = self._value()
             except Exception as e:
-                labels = ", ".join(self._render_labels())
                 LOGGER.warning(
-                    "Failed to get value for %s metric %s{%s}: %s",
+                    "Failed to get value for %s metric %s%s: %s",
                     self._type,
                     self.name,
-                    labels,
+                    self._render_labels(),
                     str(e),
                 )
                 v = NaN
@@ -129,7 +131,9 @@ class Metric(object):
             labels += [
                 f"{self._labelnames[i]}={Metric._label_value(self._labelvalues[i])}"
             ]
-        return labels
+        if not labels:
+            return ""
+        return f"{{{",".join(labels)}}}"
 
     def _with_labels(self, labelnames, labelvalues):
         if len(labelvalues) != len(labelnames):
@@ -157,12 +161,10 @@ class Metric(object):
                 if v:
                     lines += v
             return lines
-        if not self._labelvalues:
-            return
-        labels = self._render_labels()
-        return [
-            f"{self.name}{self.suffix}{{{", ".join(labels)}}} {self._render_value()}"
-        ]
+        if self._value is not None and (not self._labelnames or self._labelvalues):
+            return [
+                f"{self.name}{self.suffix}{self._render_labels()} {self._render_value()}"
+            ]
 
     def set_value(self, value):
         self._raise_if_not_observable()
@@ -170,7 +172,11 @@ class Metric(object):
             self._value = value
 
     def inc(self, amount=1):
-        self.set_value(self._value + amount)
+        self._raise_if_not_observable()
+        with self._lock:
+            if self._value is None:
+                self._value = 0
+            self._value += amount
 
     def set_function(self, f):
         if not callable(f):
@@ -241,29 +247,17 @@ class Counter(Metric):
             raise ValueError(
                 "Counters can only be incremented by non-negative amounts."
             )
-        self.inc(amount)
+        super().inc(amount)
 
 
 class Histogram(Metric):
     """A Histogram tracks the size and number of events in buckets."""
 
+    # fmt: off
     DEFAULT_BUCKETS = (
-        0.005,
-        0.01,
-        0.025,
-        0.05,
-        0.075,
-        0.1,
-        0.25,
-        0.5,
-        0.75,
-        1.0,
-        2.5,
-        5.0,
-        7.5,
-        10.0,
-        INF,
+        0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, INF,
     )
+    # fmt: on
 
     _type = "histogram"
 
@@ -289,13 +283,19 @@ class Histogram(Metric):
         self._bucket_counts = {}
         self._sum = None
         self._count = None
+        # suppress the parent series
+        self._value = None
 
     def _prepare_buckets(self):
+        # create buckets
         for b in self.buckets:
             self._bucket_counts[b] = self._with_labels(
-                ("le",) + self._labelnames, (b,) + self._labelvalues
+                ("le",) + self._labelnames,
+                (b,) + self._labelvalues
             )
             self._bucket_counts[b].suffix = "_bucket"
+            self._bucket_counts[b].inc(0)
+        # create count and sum series
         self._sum = Metric(
             self.name,
             description=self.description,
