@@ -81,6 +81,30 @@ class BackupHooksTest(unittest.TestCase):
         config.update(overrides)
         return config
 
+    def configure_server(self):
+        server_config = self.get_server_config()
+        # Configure environment variables
+        self.archive_dir = os.path.join(self.test_dir, "archive")
+        os.makedirs(self.archive_dir)
+        os.environ["NUODB_ARCHIVE_DIR"] = self.archive_dir
+        if server_config.get("external_journal", False):
+            self.journal_dir = os.path.join(self.test_dir, "journal")
+            os.makedirs(self.journal_dir)
+            os.environ["NUODB_JOURNAL_DIR"] = self.journal_dir
+        # Configure custom handlers
+        handler_config = None
+        custom_handlers = server_config.get("custom_handlers")
+        if custom_handlers:
+            handler_config = os.path.join(self.test_dir, "handlers.json")
+            with open(handler_config, "w") as f:
+                f.write(json.dumps(dict(handlers=custom_handlers)))
+        # Reload ensures that env changes are picked up and metrics are reset
+        importlib.reload(backup_hooks)
+        importlib.reload(metrics)
+        # Mock functions
+        self.mock_functions()
+        return handler_config
+
     def mock_functions(self):
         server_config = self.get_server_config()
         nuodb_processes = server_config.get(
@@ -97,23 +121,6 @@ class BackupHooksTest(unittest.TestCase):
         os.makedirs(self.test_dir)
         # Configure the server
         self.original_env = os.environ
-        self.archive_dir = os.path.join(self.test_dir, "archive")
-        os.makedirs(self.archive_dir)
-        os.environ["NUODB_ARCHIVE_DIR"] = self.archive_dir
-        # Apply overrides
-        server_config = self.get_server_config()
-        if server_config.get("external_journal", False):
-            self.journal_dir = os.path.join(self.test_dir, "journal")
-            os.makedirs(self.journal_dir)
-            os.environ["NUODB_JOURNAL_DIR"] = self.journal_dir
-        # Reload ensures that env changes are picked up and metrics are reset
-        importlib.reload(backup_hooks)
-        importlib.reload(metrics)
-        # Mock functions
-        self.mock_functions()
-        # Start backup hooks server
-        self.host = "127.0.0.1"
-        self.port = self.get_local_port()
         self.start_server()
         self._wait_until_ready()
 
@@ -146,7 +153,10 @@ class BackupHooksTest(unittest.TestCase):
         retry(lambda: _connect(), timeout)
 
     def start_server(self, handler_config=None):
-        LOGGER.info("Starting server on %s:%d", self.host, self.port)
+        handler_config = self.configure_server()
+        self.host = "127.0.0.1"
+        self.port = self.get_local_port()
+        LOGGER.info("Starting hooks server on %s:%d", self.host, self.port)
         self.httpd = make_server(self.host, self.port, HooksHandler(handler_config))
         self.server_thread = Thread(target=self.httpd.serve_forever, daemon=True)
         self.server_thread.start()
@@ -259,6 +269,16 @@ class BackupHooksTest(unittest.TestCase):
             data.get("message"),
         )
 
+    @ConfigOverrides(
+        custom_handlers=[
+            {
+                "method": "GET",
+                "path": "/exit",
+                "script": "exit ${code:=0}",
+                "statusMappings": {"1": 500, "2": 400},
+            }
+        ]
+    )
     def testVolumeMetrics(self):
         external_journal = self.get_server_config().get("external_journal", False)
 
@@ -328,6 +348,57 @@ class BackupHooksTest(unittest.TestCase):
             # TODO(siv3): figure out why fails
             # self.assertIn("nuodb_archive_frozen_seconds_count 1", out)
             # self.assertIn('nuodb_archive_frozen_seconds_sum', out)
+
+        # request custom handler
+        resp, data = self.request(method="GET", path="/exit")
+        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+        resp, data = self.request(method="GET", path="/exit?code=1")
+        self.assertEqual(http.HTTPStatus.INTERNAL_SERVER_ERROR, resp.status, str(data))
+        resp, data = self.request(method="GET", path="/exit?code=2")
+        self.assertEqual(http.HTTPStatus.BAD_REQUEST, resp.status, str(data))
+
+        # request metrics endpoint again
+        resp, data = self.request(method="GET", path="/metrics")
+        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+        out = data.decode("utf-8")
+
+        # verify that hook request latency Histogram is emitted
+        self.assertIn(
+            'hook_request_duration_seconds_bucket{le="+Inf", method="GET", endpoint="/exit", http_status="200"} 1',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_count{method="GET", endpoint="/exit", http_status="200"} 1',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_sum{method="GET", endpoint="/exit", http_status="200"}',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_bucket{le="+Inf", method="GET", endpoint="/exit", http_status="500"} 1',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_count{method="GET", endpoint="/exit", http_status="500"} 1',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_sum{method="GET", endpoint="/exit", http_status="500"}',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_bucket{le="+Inf", method="GET", endpoint="/exit", http_status="400"} 1',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_count{method="GET", endpoint="/exit", http_status="400"} 1',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_sum{method="GET", endpoint="/exit", http_status="400"}',
+            out,
+        )
 
 
 class BackupHooksExternalJournalTest(BackupHooksTest):

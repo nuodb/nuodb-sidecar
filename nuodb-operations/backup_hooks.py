@@ -689,7 +689,10 @@ class HooksHandler(object):
                 matches, path_params = handler.matches(req.method, req.components)
                 if matches:
                     path = handler.path
-                    return handler.execute(path_params, req.query_params, req.payload)
+                    status, resp_data = handler.execute(
+                        path_params, req.query_params, req.payload
+                    )
+                    return status, resp_data
             # Dispatch to matching built-in handler
             path, resp_data = handle_method(req)
             if resp_data is None:
