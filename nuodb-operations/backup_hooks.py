@@ -646,6 +646,14 @@ class HooksHandler(object):
     def __init__(self, handler_config=None):
         self.handlers = read_handler_config(handler_config)
         self.log_handlers()
+        # Register metric functions
+        VOLUME_AVAILABLE_BYTES.labels("archive-volume").set_function(
+            lambda: disk_usage(ARCHIVE_DIR)[2]
+        )
+        if JOURNAL_DIR:
+            VOLUME_AVAILABLE_BYTES.labels("journal-volume").set_function(
+                lambda: disk_usage(JOURNAL_DIR)[2]
+            )
 
     def log_handlers(self, indent=4):
         # Log all built-in handlers
@@ -692,9 +700,11 @@ class HooksHandler(object):
             status, data = create_error(e)
             return status, data
         finally:
-            HOOK_REQUEST_DURATION_SECONDS.labels(req.method, path, str(status)).observe(
-                time.time() - start_time
-            )
+            HOOK_REQUEST_DURATION_SECONDS.labels(
+                req.method,
+                "/" + normalize_path(path),
+                str(status),
+            ).observe(time.time() - start_time)
 
     def __call__(self, environ, start_response):
         status, json_response = self.handle(environ)
@@ -703,14 +713,6 @@ class HooksHandler(object):
 
 def start_server(port, handler_config):
     hooks_handler = HooksHandler(handler_config)
-    # Register metric functions
-    VOLUME_AVAILABLE_BYTES.labels("archive-volume").set_function(
-        lambda: disk_usage(ARCHIVE_DIR)[2]
-    )
-    if JOURNAL_DIR:
-        VOLUME_AVAILABLE_BYTES.labels("journal-volume").set_function(
-            lambda: disk_usage(JOURNAL_DIR)[2]
-        )
     with simple_server.make_server("", port, hooks_handler) as httpd:
         LOGGER.info("Starting backup hooks server on port %s", port)
         httpd.serve_forever()

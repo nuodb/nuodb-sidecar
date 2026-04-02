@@ -1,6 +1,9 @@
 import threading
 import re
 import json
+import logging
+
+LOGGER = logging.getLogger(__name__)
 
 
 class MetricRegistry(object):
@@ -28,6 +31,7 @@ REGISTRY = MetricRegistry()
 LABEL_NAME_PATTERN = re.compile("^[a-zA-Z_:][a-zA-Z0-9_:]*$")
 
 INF = float("inf")
+NaN = float("NaN")
 
 
 class Metric(object):
@@ -59,7 +63,7 @@ class Metric(object):
 
     def _header(self):
         return [
-            f"# description {self.name} {self.description}",
+            f"# HELP {self.name} {self.description}",
             f"# TYPE {self.name} {self._type}",
         ]
 
@@ -86,10 +90,38 @@ class Metric(object):
             )
 
     @staticmethod
-    def _label_value(v):
+    def _normalize_value(v):
         if v == INF:
             return "+Inf"
+        if v is NaN:
+            return "NaN"
+        return v
+
+    @staticmethod
+    def _label_value(v):
+        v = Metric._normalize_value(v)
+        if isinstance(v, float):
+            # labels are strings
+            v = f"{v}"
         return json.dumps(v)
+
+    def _render_value(self):
+        v = self._value
+        if callable(self._value):
+            # Call value function
+            try:
+                v = self._value()
+            except Exception as e:
+                labels = ", ".join(self._render_labels())
+                LOGGER.warning(
+                    "Failed to get value for %s metric %s{%s}: %s",
+                    self._type,
+                    self.name,
+                    labels,
+                    str(e),
+                )
+                v = NaN
+        return Metric._normalize_value(v)
 
     def _render_labels(self):
         labels = []
@@ -128,10 +160,9 @@ class Metric(object):
         if not self._labelvalues:
             return
         labels = self._render_labels()
-        v = self._value
-        if callable(self._value):
-            v = self._value()
-        return [f"{self.name}{self.suffix}{{{", ".join(labels)}}} {v}"]
+        return [
+            f"{self.name}{self.suffix}{{{", ".join(labels)}}} {self._render_value()}"
+        ]
 
     def set_value(self, value):
         self._raise_if_not_observable()

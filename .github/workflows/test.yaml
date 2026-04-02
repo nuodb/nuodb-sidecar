@@ -26,6 +26,7 @@ jobs:
           cache: 'pip'
       - name: Install dependencies
         run: |
+          pip install -r nuodb-operations/test-requirements.txt
           pip install -r config_watcher/test-requirements.txt
           pip install -r config_watcher/requirements.txt
       - name: Test code formatting
@@ -50,11 +51,19 @@ jobs:
           path: test-results/reports/config_watcher.xml
           reporter: java-junit
           fail-on-error: true
+      - name: Test report
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: results-nuodb-operations-${{ matrix.python-version }}
+          path: test-results/reports/nuodb-operations.xml
+          reporter: java-junit
+          fail-on-error: true
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-results-${{ matrix.python-version }}
           path: |
-            test-results/config_watcher
+            test-results
           retention-days: 7
