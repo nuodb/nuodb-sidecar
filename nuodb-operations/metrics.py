@@ -290,8 +290,7 @@ class Histogram(Metric):
         # create buckets
         for b in self.buckets:
             self._bucket_counts[b] = self._with_labels(
-                ("le",) + self._labelnames,
-                (b,) + self._labelvalues
+                ("le",) + self._labelnames, (b,) + self._labelvalues
             )
             self._bucket_counts[b].suffix = "_bucket"
             self._bucket_counts[b].inc(0)
