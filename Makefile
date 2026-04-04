@@ -55,12 +55,17 @@ fmt:
 ##@ Testing
 
 .PHONY: test
-test: test-config-watcher ## Run tests
+test: test-nuodb-operations test-config-watcher ## Run tests
 
 test-config-watcher: test-setup
 	cd config_watcher \
 		&& python3 -m pytest \
 			--junitxml $(OUTPUT_DIR)/reports/config_watcher.xml
+
+test-nuodb-operations:
+	cd nuodb-operations \
+		&& python3 -m pytest \
+			--junitxml $(OUTPUT_DIR)/reports/nuodb-operations.xml
 
 test-setup: $(KWOKCTL) $(KUBECTL) ## Run tests setup
 	mkdir -p $(TMP_DIR)
