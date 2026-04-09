@@ -789,12 +789,16 @@ def main():
     if args.subcommand == "server":
         start_server(args.port, args.handler_config)
     if args.subcommand == "pre-hook":
+        if not has_archives():
+            raise RuntimeError("No archive path configured on this container")
         # read opaque data and pass it to pre-hook
         opaque = None
         if args.opaque_file:
             opaque = args.opaque_file.read()
         pre_backup(args.backup_id, dict(opaque=opaque, timeout=args.timeout))
     elif args.subcommand == "post-hook":
+        if not has_archives():
+            raise RuntimeError("No archive path configured on this container")
         post_backup(args.backup_id, dict(force=args.force))
 
 
