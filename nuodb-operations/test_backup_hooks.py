@@ -14,6 +14,8 @@ import http
 from http.client import HTTPConnection
 from threading import Thread
 from wsgiref.simple_server import make_server
+import sys
+import shlex
 
 import metrics
 import backup_hooks
@@ -46,14 +48,11 @@ class ConfigOverrides(object):
         return testMethod
 
 
-class BackupHooksTest(unittest.TestCase):
+class WebHooksTest(unittest.TestCase):
     hooks_dir = os.path.dirname(os.path.abspath(__file__))
     test_results_dir = os.path.join(
         os.path.dirname(hooks_dir), "test-results", "nuodb-operations"
     )
-
-    def path(self, *args):
-        return os.path.join(self.test_dir, *args)
 
     @classmethod
     def setUpClass(cls):
@@ -84,9 +83,10 @@ class BackupHooksTest(unittest.TestCase):
     def configure_server(self):
         server_config = self.get_server_config()
         # Configure environment variables
-        self.archive_dir = os.path.join(self.test_dir, "archive")
-        os.makedirs(self.archive_dir)
-        os.environ["NUODB_ARCHIVE_DIR"] = self.archive_dir
+        if server_config.get("has_archives", True):
+            self.archive_dir = os.path.join(self.test_dir, "archive")
+            os.makedirs(self.archive_dir)
+            os.environ["NUODB_ARCHIVE_DIR"] = self.archive_dir
         if server_config.get("external_journal", False):
             self.journal_dir = os.path.join(self.test_dir, "journal")
             os.makedirs(self.journal_dir)
@@ -105,16 +105,6 @@ class BackupHooksTest(unittest.TestCase):
         self.mock_functions()
         return handler_config
 
-    def mock_functions(self):
-        server_config = self.get_server_config()
-        nuodb_processes = server_config.get(
-            "nuodb_processes", [{"pid": 1234, "sid": 0}]
-        )
-        self.nuodb_processes_patch = mock.patch(
-            "backup_hooks.get_nuodb_process_info", return_value=nuodb_processes
-        )
-        self.nuodb_processes_mock = self.nuodb_processes_patch.start()
-
     def setUp(self):
         # Create test tmp directory
         self.test_dir = os.path.join(self.tmp_dir, self._testMethodName)
@@ -124,9 +114,11 @@ class BackupHooksTest(unittest.TestCase):
         self.start_server()
         self._wait_until_ready()
 
+    def mock_functions(self):
+        pass
+
     def tearDown(self):
         self.stop_server()
-        self.nuodb_processes_patch.stop()
         # Restore environment variables
         os.environ.clear()
         os.environ.update(self.original_env)
@@ -180,6 +172,26 @@ class BackupHooksTest(unittest.TestCase):
             return resp, data
         finally:
             conn.close()
+
+
+class BackupHooksTest(WebHooksTest):
+
+    def path(self, *args):
+        return os.path.join(self.test_dir, *args)
+
+    def mock_functions(self):
+        server_config = self.get_server_config()
+        nuodb_processes = server_config.get(
+            "nuodb_processes", [{"pid": 1234, "sid": 0}]
+        )
+        self.nuodb_processes_patch = mock.patch(
+            "backup_hooks.get_nuodb_process_info", return_value=nuodb_processes
+        )
+        self.nuodb_processes_mock = self.nuodb_processes_patch.start()
+
+    def tearDown(self):
+        self.nuodb_processes_patch.stop()
+        super().tearDown()
 
     def pre_backup(self, backup_id, opaque=None):
         resp, data = self.request(
@@ -413,6 +425,164 @@ class BackupHooksExternalJournalTest(BackupHooksTest):
     def tearDown(self):
         super().tearDown()
         self.freeze_archive_patch.stop()
+
+
+class NoArchivesHandlersTest(WebHooksTest):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.server_config = dict(has_archives=False)
+
+    def testNoHooks(self):
+        resp, data = self.request(
+            method="POST",
+            path=f"/pre-backup/{uuid.uuid4()}",
+            body=None,
+            headers={"Content-Type": "application/json"},
+        )
+        data = json.loads(data)
+        self.assertEqual(http.HTTPStatus.BAD_REQUEST, resp.status, str(data))
+        self.assertFalse(data["success"])
+        self.assertIn("No handler found for path /pre-backup/", data["message"])
+
+        resp, data = self.request(
+            method="POST",
+            path=f"/post-backup/{uuid.uuid4()}",
+        )
+        data = json.loads(data)
+        self.assertEqual(http.HTTPStatus.BAD_REQUEST, resp.status, str(data))
+        self.assertFalse(data["success"])
+        self.assertIn("No handler found for path /post-backup/", data["message"])
+
+    @ConfigOverrides(
+        custom_handlers=[
+            {
+                "method": "GET",
+                "path": "/exit",
+                "script": "exit ${code:=0}",
+                "statusMappings": {"1": 500, "2": 400},
+            }
+        ]
+    )
+    def testMetrics(self):
+        # request metrics endpoint
+        resp, data = self.request(method="GET", path="/metrics")
+        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+        out = data.decode("utf-8")
+
+        # verify that volume metrics are reported
+        self.assertNotIn('nuodb_volume_available_bytes{volume="archive-volume"}', out)
+
+        self.assertNotIn('nuodb_volume_available_bytes{volume="journal-volume"}', out)
+
+        # request metrics endpoint again
+        resp, data = self.request(method="GET", path="/metrics")
+        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+        out = data.decode("utf-8")
+
+        # verify that hook request latency Histogram is emitted
+        self.assertIn(
+            'hook_request_duration_seconds_bucket{le="1.0",method="GET",endpoint="/metrics",http_status="200"} 1',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_bucket{le="+Inf",method="GET",endpoint="/metrics",http_status="200"} 1',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_bucket{le="+Inf",method="GET",endpoint="/metrics",http_status="200"} 1',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_count{method="GET",endpoint="/metrics",http_status="200"} 1',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_sum{method="GET",endpoint="/metrics",http_status="200"}',
+            out,
+        )
+
+        # request custom handler
+        resp, data = self.request(method="GET", path="/exit")
+        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+        resp, data = self.request(method="GET", path="/exit?code=1")
+        self.assertEqual(http.HTTPStatus.INTERNAL_SERVER_ERROR, resp.status, str(data))
+        resp, data = self.request(method="GET", path="/exit?code=2")
+        self.assertEqual(http.HTTPStatus.BAD_REQUEST, resp.status, str(data))
+
+        # request metrics endpoint again
+        resp, data = self.request(method="GET", path="/metrics")
+        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+        out = data.decode("utf-8")
+
+        # verify that hook request latency Histogram is emitted
+        self.assertIn(
+            'hook_request_duration_seconds_bucket{le="+Inf",method="GET",endpoint="/exit",http_status="200"} 1',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_count{method="GET",endpoint="/exit",http_status="200"} 1',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_sum{method="GET",endpoint="/exit",http_status="200"}',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_bucket{le="+Inf",method="GET",endpoint="/exit",http_status="500"} 1',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_count{method="GET",endpoint="/exit",http_status="500"} 1',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_sum{method="GET",endpoint="/exit",http_status="500"}',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_bucket{le="+Inf",method="GET",endpoint="/exit",http_status="400"} 1',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_count{method="GET",endpoint="/exit",http_status="400"} 1',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_sum{method="GET",endpoint="/exit",http_status="400"}',
+            out,
+        )
+
+
+class CliTests(unittest.TestCase):
+    def testNoArchives(self):
+        "Test CLI options that should be disabled if no archive directory is configured"
+        with mock.patch.dict("os.environ") as mockenv:
+            mockenv.pop("NUODB_ARCHIVE_DIR", None)
+
+            with mock.patch.object(
+                sys,
+                "argv",
+                shlex.split("backup_hooks.py pre-hook --backup-id not-needed"),
+            ):
+                mockenv.pop("NUODB_ARCHIVE_DIR", None)
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "No archive path configured on this container",
+                    backup_hooks.main,
+                )
+
+            with mock.patch.object(
+                sys,
+                "argv",
+                shlex.split("backup_hooks.py post-hook --backup-id not-needed"),
+            ):
+                mockenv.pop("NUODB_ARCHIVE_DIR", None)
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "No archive path configured on this container",
+                    backup_hooks.main,
+                )
 
 
 if __name__ == "__main__":

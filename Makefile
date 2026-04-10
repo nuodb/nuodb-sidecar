@@ -63,9 +63,9 @@ test-config-watcher: test-setup python-libs
 		&& PYTHONPATH=$(PYTHONPATH) python3 -m pytest \
 			--junitxml $(OUTPUT_DIR)/reports/config_watcher.xml
 
-test-nuodb-operations:
+test-nuodb-operations: python-libs
 	cd nuodb-operations \
-		&& python3 -m pytest \
+		&& PYTHONPATH=$(PYTHONPATH) python3 -m pytest \
 			--junitxml $(OUTPUT_DIR)/reports/nuodb-operations.xml
 
 test-setup: $(KWOKCTL) $(KUBECTL) ## Run tests setup
