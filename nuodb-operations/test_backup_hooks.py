@@ -173,6 +173,100 @@ class WebHooksTest(unittest.TestCase):
         finally:
             conn.close()
 
+    @ConfigOverrides(
+        custom_handlers=[
+            {
+                "method": "GET",
+                "path": "/exit",
+                "script": "exit ${code:=0}",
+                "statusMappings": {"1": 500, "2": 400},
+            }
+        ]
+    )
+    def testMetrics(self):
+        # request metrics endpoint
+        resp, data = self.request(method="GET", path="/metrics")
+        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+        out = data.decode("utf-8")
+
+        # request metrics endpoint again
+        resp, data = self.request(method="GET", path="/metrics")
+        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+        out = data.decode("utf-8")
+
+        # verify that hook request latency Histogram is emitted
+        self.assertIn(
+            'hook_request_duration_seconds_bucket{le="1.0",method="GET",endpoint="/metrics",http_status="200"} 1',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_bucket{le="+Inf",method="GET",endpoint="/metrics",http_status="200"} 1',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_bucket{le="+Inf",method="GET",endpoint="/metrics",http_status="200"} 1',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_count{method="GET",endpoint="/metrics",http_status="200"} 1',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_sum{method="GET",endpoint="/metrics",http_status="200"}',
+            out,
+        )
+
+        # request custom handler
+        resp, data = self.request(method="GET", path="/exit")
+        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+        resp, data = self.request(method="GET", path="/exit?code=1")
+        self.assertEqual(http.HTTPStatus.INTERNAL_SERVER_ERROR, resp.status, str(data))
+        resp, data = self.request(method="GET", path="/exit?code=2")
+        self.assertEqual(http.HTTPStatus.BAD_REQUEST, resp.status, str(data))
+
+        # request metrics endpoint again
+        resp, data = self.request(method="GET", path="/metrics")
+        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+        out = data.decode("utf-8")
+
+        # verify that hook request latency Histogram is emitted
+        self.assertIn(
+            'hook_request_duration_seconds_bucket{le="+Inf",method="GET",endpoint="/exit",http_status="200"} 1',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_count{method="GET",endpoint="/exit",http_status="200"} 1',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_sum{method="GET",endpoint="/exit",http_status="200"}',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_bucket{le="+Inf",method="GET",endpoint="/exit",http_status="500"} 1',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_count{method="GET",endpoint="/exit",http_status="500"} 1',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_sum{method="GET",endpoint="/exit",http_status="500"}',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_bucket{le="+Inf",method="GET",endpoint="/exit",http_status="400"} 1',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_count{method="GET",endpoint="/exit",http_status="400"} 1',
+            out,
+        )
+        self.assertIn(
+            'hook_request_duration_seconds_sum{method="GET",endpoint="/exit",http_status="400"}',
+            out,
+        )
+
 
 class BackupHooksTest(WebHooksTest):
 
@@ -291,7 +385,7 @@ class BackupHooksTest(WebHooksTest):
             }
         ]
     )
-    def testMetrics(self):
+    def testBackupHookMetrics(self):
         # request metrics endpoint
         resp, data = self.request(method="GET", path="/metrics")
         self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
@@ -309,33 +403,6 @@ class BackupHooksTest(WebHooksTest):
             self.assertNotIn(
                 'nuodb_volume_available_bytes{volume="journal-volume"}', out
             )
-
-        # request metrics endpoint again
-        resp, data = self.request(method="GET", path="/metrics")
-        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
-        out = data.decode("utf-8")
-
-        # verify that hook request latency Histogram is emitted
-        self.assertIn(
-            'hook_request_duration_seconds_bucket{le="1.0",method="GET",endpoint="/metrics",http_status="200"} 1',
-            out,
-        )
-        self.assertIn(
-            'hook_request_duration_seconds_bucket{le="+Inf",method="GET",endpoint="/metrics",http_status="200"} 1',
-            out,
-        )
-        self.assertIn(
-            'hook_request_duration_seconds_bucket{le="+Inf",method="GET",endpoint="/metrics",http_status="200"} 1',
-            out,
-        )
-        self.assertIn(
-            'hook_request_duration_seconds_count{method="GET",endpoint="/metrics",http_status="200"} 1',
-            out,
-        )
-        self.assertIn(
-            'hook_request_duration_seconds_sum{method="GET",endpoint="/metrics",http_status="200"}',
-            out,
-        )
 
         # call backup hooks
         backup_id = str(uuid.uuid4())
@@ -357,57 +424,6 @@ class BackupHooksTest(WebHooksTest):
         self.assertIn("snapshot_backup_duration_seconds_count 1", out)
         self.assertIn("snapshot_backup_duration_seconds_sum", out)
         self.assertNotIn("snapshot_backup_duration_seconds 0", out)
-
-        # request custom handler
-        resp, data = self.request(method="GET", path="/exit")
-        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
-        resp, data = self.request(method="GET", path="/exit?code=1")
-        self.assertEqual(http.HTTPStatus.INTERNAL_SERVER_ERROR, resp.status, str(data))
-        resp, data = self.request(method="GET", path="/exit?code=2")
-        self.assertEqual(http.HTTPStatus.BAD_REQUEST, resp.status, str(data))
-
-        # request metrics endpoint again
-        resp, data = self.request(method="GET", path="/metrics")
-        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
-        out = data.decode("utf-8")
-
-        # verify that hook request latency Histogram is emitted
-        self.assertIn(
-            'hook_request_duration_seconds_bucket{le="+Inf",method="GET",endpoint="/exit",http_status="200"} 1',
-            out,
-        )
-        self.assertIn(
-            'hook_request_duration_seconds_count{method="GET",endpoint="/exit",http_status="200"} 1',
-            out,
-        )
-        self.assertIn(
-            'hook_request_duration_seconds_sum{method="GET",endpoint="/exit",http_status="200"}',
-            out,
-        )
-        self.assertIn(
-            'hook_request_duration_seconds_bucket{le="+Inf",method="GET",endpoint="/exit",http_status="500"} 1',
-            out,
-        )
-        self.assertIn(
-            'hook_request_duration_seconds_count{method="GET",endpoint="/exit",http_status="500"} 1',
-            out,
-        )
-        self.assertIn(
-            'hook_request_duration_seconds_sum{method="GET",endpoint="/exit",http_status="500"}',
-            out,
-        )
-        self.assertIn(
-            'hook_request_duration_seconds_bucket{le="+Inf",method="GET",endpoint="/exit",http_status="400"} 1',
-            out,
-        )
-        self.assertIn(
-            'hook_request_duration_seconds_count{method="GET",endpoint="/exit",http_status="400"} 1',
-            out,
-        )
-        self.assertIn(
-            'hook_request_duration_seconds_sum{method="GET",endpoint="/exit",http_status="400"}',
-            out,
-        )
 
 
 class BackupHooksExternalJournalTest(BackupHooksTest):
@@ -454,17 +470,7 @@ class NoArchivesHandlersTest(WebHooksTest):
         self.assertFalse(data["success"])
         self.assertIn("No handler found for path /post-backup/", data["message"])
 
-    @ConfigOverrides(
-        custom_handlers=[
-            {
-                "method": "GET",
-                "path": "/exit",
-                "script": "exit ${code:=0}",
-                "statusMappings": {"1": 500, "2": 400},
-            }
-        ]
-    )
-    def testMetrics(self):
+    def testNoArchiveMetrics(self):
         # request metrics endpoint
         resp, data = self.request(method="GET", path="/metrics")
         self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
@@ -474,84 +480,6 @@ class NoArchivesHandlersTest(WebHooksTest):
         self.assertNotIn('nuodb_volume_available_bytes{volume="archive-volume"}', out)
 
         self.assertNotIn('nuodb_volume_available_bytes{volume="journal-volume"}', out)
-
-        # request metrics endpoint again
-        resp, data = self.request(method="GET", path="/metrics")
-        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
-        out = data.decode("utf-8")
-
-        # verify that hook request latency Histogram is emitted
-        self.assertIn(
-            'hook_request_duration_seconds_bucket{le="1.0",method="GET",endpoint="/metrics",http_status="200"} 1',
-            out,
-        )
-        self.assertIn(
-            'hook_request_duration_seconds_bucket{le="+Inf",method="GET",endpoint="/metrics",http_status="200"} 1',
-            out,
-        )
-        self.assertIn(
-            'hook_request_duration_seconds_bucket{le="+Inf",method="GET",endpoint="/metrics",http_status="200"} 1',
-            out,
-        )
-        self.assertIn(
-            'hook_request_duration_seconds_count{method="GET",endpoint="/metrics",http_status="200"} 1',
-            out,
-        )
-        self.assertIn(
-            'hook_request_duration_seconds_sum{method="GET",endpoint="/metrics",http_status="200"}',
-            out,
-        )
-
-        # request custom handler
-        resp, data = self.request(method="GET", path="/exit")
-        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
-        resp, data = self.request(method="GET", path="/exit?code=1")
-        self.assertEqual(http.HTTPStatus.INTERNAL_SERVER_ERROR, resp.status, str(data))
-        resp, data = self.request(method="GET", path="/exit?code=2")
-        self.assertEqual(http.HTTPStatus.BAD_REQUEST, resp.status, str(data))
-
-        # request metrics endpoint again
-        resp, data = self.request(method="GET", path="/metrics")
-        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
-        out = data.decode("utf-8")
-
-        # verify that hook request latency Histogram is emitted
-        self.assertIn(
-            'hook_request_duration_seconds_bucket{le="+Inf",method="GET",endpoint="/exit",http_status="200"} 1',
-            out,
-        )
-        self.assertIn(
-            'hook_request_duration_seconds_count{method="GET",endpoint="/exit",http_status="200"} 1',
-            out,
-        )
-        self.assertIn(
-            'hook_request_duration_seconds_sum{method="GET",endpoint="/exit",http_status="200"}',
-            out,
-        )
-        self.assertIn(
-            'hook_request_duration_seconds_bucket{le="+Inf",method="GET",endpoint="/exit",http_status="500"} 1',
-            out,
-        )
-        self.assertIn(
-            'hook_request_duration_seconds_count{method="GET",endpoint="/exit",http_status="500"} 1',
-            out,
-        )
-        self.assertIn(
-            'hook_request_duration_seconds_sum{method="GET",endpoint="/exit",http_status="500"}',
-            out,
-        )
-        self.assertIn(
-            'hook_request_duration_seconds_bucket{le="+Inf",method="GET",endpoint="/exit",http_status="400"} 1',
-            out,
-        )
-        self.assertIn(
-            'hook_request_duration_seconds_count{method="GET",endpoint="/exit",http_status="400"} 1',
-            out,
-        )
-        self.assertIn(
-            'hook_request_duration_seconds_sum{method="GET",endpoint="/exit",http_status="400"}',
-            out,
-        )
 
 
 class CliTests(unittest.TestCase):

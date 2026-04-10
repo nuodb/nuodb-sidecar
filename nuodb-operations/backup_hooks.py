@@ -676,22 +676,16 @@ class HooksHandler(object):
 
     def log_handlers(self, indent=4):
         # Log all built-in handlers
+        builtins = list(REGISTERED_HANDLERS)
         builtin_handlers = []
         if has_archives():
-            for method, path_prefix, handler in ARCHIVE_HANDLERS:
-                path = path_prefix
-                for arg in inspect.getfullargspec(handler).args:
-                    if arg not in ["payload", "query"]:
-                        path += "/{" + arg + "}"
-                builtin_handlers.append(
-                    "{}{} /{}".format(indent * " ", method, normalize_path(path))
-                )
+            builtins += ARCHIVE_HANDLERS
         else:
             LOGGER.warning(
                 "No archive dir found, not configuring certain built-in handlers."
             )
 
-        for method, path_prefix, handler in REGISTERED_HANDLERS:
+        for method, path_prefix, handler in builtins:
             path = path_prefix
             for arg in inspect.getfullargspec(handler).args:
                 if arg not in ["payload", "query"]:
