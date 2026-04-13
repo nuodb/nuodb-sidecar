@@ -24,9 +24,6 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'
-      - name: Install dependencies
-        run: |
-          make python-libs
       - name: Test code formatting
         run: |
           make fmt

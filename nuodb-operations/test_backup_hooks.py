@@ -48,7 +48,7 @@ class ConfigOverrides(object):
         return testMethod
 
 
-class WebHooksTest(unittest.TestCase):
+class HttpHandlersTests(unittest.TestCase):
     hooks_dir = os.path.dirname(os.path.abspath(__file__))
     test_results_dir = os.path.join(
         os.path.dirname(hooks_dir), "test-results", "nuodb-operations"
@@ -268,7 +268,7 @@ class WebHooksTest(unittest.TestCase):
         )
 
 
-class BackupHooksTest(WebHooksTest):
+class BackupHooksTest(HttpHandlersTests):
 
     def path(self, *args):
         return os.path.join(self.test_dir, *args)
@@ -443,7 +443,7 @@ class BackupHooksExternalJournalTest(BackupHooksTest):
         self.freeze_archive_patch.stop()
 
 
-class NoArchivesHandlersTest(WebHooksTest):
+class NoArchivesHandlersTest(HttpHandlersTests):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()

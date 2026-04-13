@@ -1,10 +1,12 @@
 PROJECT_DIR := $(shell pwd)
 BIN_DIR ?= $(PROJECT_DIR)/bin
 OUTPUT_DIR ?= $(PROJECT_DIR)/test-results
+VENV_DIR ?= $(BIN_DIR)/venv
 export TMP_DIR ?= $(OUTPUT_DIR)/tmp
-export PATH := $(BIN_DIR):$(PATH)
+export PATH := $(BIN_DIR):$(VENV_DIR)/bin:$(PATH)
 export KUBECONFIG ?= $(TMP_DIR)/kubeconfig.yaml
-export PYTHONPATH := $(BIN_DIR)/python-libs
+
+VENV := $(VENV_DIR)/touchfile #file to mark that venv is set up
 
 OS := $(shell go env GOOS)
 ARCH := $(shell go env GOARCH)
@@ -47,25 +49,25 @@ help: ## Display this help.
 ##@ Development
 
 .PHONY: lint
-lint: python-libs $(patsubst %.py,%.pylint,$(PYTHONFILES)) ## Lint Python files
+lint: $(VENV) $(patsubst %.py,%.pylint,$(PYTHONFILES)) ## Lint Python files
 
 .PHONY: fmt ## Format Python files
-fmt: python-libs
-	PYTHONPATH=$(PYTHONPATH) python3 -m black --quiet $(PYTHONFILES) $(PYTHONTESTFILES)
+fmt: $(VENV)
+	python3 -m black --quiet $(PYTHONFILES) $(PYTHONTESTFILES)
 
 ##@ Testing
 
 .PHONY: test
 test: test-nuodb-operations test-config-watcher ## Run tests
 
-test-config-watcher: test-setup python-libs
+test-config-watcher: test-setup $(VENV)
 	cd config_watcher \
-		&& PYTHONPATH=$(PYTHONPATH) python3 -m pytest \
+		&& python3 -m pytest \
 			--junitxml $(OUTPUT_DIR)/reports/config_watcher.xml
 
-test-nuodb-operations: python-libs
+test-nuodb-operations: $(VENV)
 	cd nuodb-operations \
-		&& PYTHONPATH=$(PYTHONPATH) python3 -m pytest \
+		&& python3 -m pytest \
 			--junitxml $(OUTPUT_DIR)/reports/nuodb-operations.xml
 
 test-setup: $(KWOKCTL) $(KUBECTL) ## Run tests setup
@@ -81,9 +83,10 @@ test-teardown: $(KWOKCTL) ## Run tests teardown
 docker-build: ## Build NuoDB sidecar docker image.
 	IMG_REPO="$(IMG_REPO)" IMG_TAG="$(IMG_TAG)" ./docker/build.sh
 
-.PHONY: python-libs
-python-libs: ## Download python dependencies
-	pip3 install -r nuodb-operations/test-requirements.txt -r config_watcher/test-requirements.txt -r config_watcher/requirements.txt --upgrade  -t $(PYTHONPATH)
+$(VENV): nuodb-operations/test-requirements.txt config_watcher/test-requirements.txt config_watcher/requirements.txt
+	python3 -m venv $(VENV_DIR)
+	pip3 install -r nuodb-operations/test-requirements.txt -r config_watcher/test-requirements.txt -r config_watcher/requirements.txt --ignore-installed 
+	touch $(VENV)
 
 $(KUBECTL):
 	mkdir -p bin
@@ -96,4 +99,4 @@ $(KWOKCTL):
 	chmod +x $(KWOKCTL)
 
 %.pylint:
-	PYTHONPATH=$(PYTHONPATH) $(PYLINT) $(PYLINTFLAGS) $*.py
+	$(PYLINT) $(PYLINTFLAGS) $*.py

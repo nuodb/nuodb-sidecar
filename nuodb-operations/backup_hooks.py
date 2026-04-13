@@ -446,12 +446,12 @@ def create_error(exc):
     return http.HTTPStatus.INTERNAL_SERVER_ERROR, dict(success=False, message=str(exc))
 
 
-ARCHIVE_HANDLERS = [
+SM_HANDLERS = [
     ("POST", "pre-backup", pre_backup),
     ("POST", "post-backup", post_backup),
 ]
 
-REGISTERED_HANDLERS = [
+COMMON_HANDLERS = [
     ("GET", "metrics", lambda: REGISTRY.collect()),  # pylint: disable=W0108
 ]
 
@@ -485,9 +485,16 @@ def normalize_path(path):
     return path[1:] if path.startswith("/") else path
 
 
-def has_archives():
+def has_archive():
     """Check if there is an archive configured on the container."""
     return "NUODB_ARCHIVE_DIR" in os.environ
+
+
+def get_builtin_handlers():
+    handlers = list(COMMON_HANDLERS)
+    if has_archive():
+        handlers += SM_HANDLERS
+    return handlers
 
 
 class ScriptHandler(object):
@@ -603,11 +610,7 @@ class RequestInfo(object):  # pylint: disable=too-few-public-methods
 
 def handle_method(req):
     # Find a handler that matches the request
-    handlers = list(REGISTERED_HANDLERS)
-    if has_archives():
-        handlers += ARCHIVE_HANDLERS
-
-    for method, path_prefix, handler in handlers:
+    for method, path_prefix, handler in get_builtin_handlers():
         if req.method == method and req.components[0] == path_prefix:
             # Make sure the correct number of parameters were supplied by
             # inspecting method signature
@@ -665,7 +668,7 @@ class HooksHandler(object):
         self.handlers = read_handler_config(handler_config)
         self.log_handlers()
         # Register metric functions
-        if has_archives():
+        if has_archive():
             VOLUME_AVAILABLE_BYTES.labels("archive-volume").set_function(
                 lambda: disk_usage(ARCHIVE_DIR)[2]
             )
@@ -676,16 +679,13 @@ class HooksHandler(object):
 
     def log_handlers(self, indent=4):
         # Log all built-in handlers
-        builtins = list(REGISTERED_HANDLERS)
         builtin_handlers = []
-        if has_archives():
-            builtins += ARCHIVE_HANDLERS
-        else:
+        if not has_archive():
             LOGGER.warning(
                 "No archive dir found, not configuring certain built-in handlers."
             )
 
-        for method, path_prefix, handler in builtins:
+        for method, path_prefix, handler in get_builtin_handlers():
             path = path_prefix
             for arg in inspect.getfullargspec(handler).args:
                 if arg not in ["payload", "query"]:
@@ -799,7 +799,7 @@ def main():
     if args.subcommand == "server":
         start_server(args.port, args.handler_config)
     if args.subcommand == "pre-hook":
-        if not has_archives():
+        if not has_archive():
             raise RuntimeError("No archive path configured on this container")
         # read opaque data and pass it to pre-hook
         opaque = None
@@ -807,7 +807,7 @@ def main():
             opaque = args.opaque_file.read()
         pre_backup(args.backup_id, dict(opaque=opaque, timeout=args.timeout))
     elif args.subcommand == "post-hook":
-        if not has_archives():
+        if not has_archive():
             raise RuntimeError("No archive path configured on this container")
         post_backup(args.backup_id, dict(force=args.force))
 
