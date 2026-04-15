@@ -1,9 +1,12 @@
 PROJECT_DIR := $(shell pwd)
 BIN_DIR ?= $(PROJECT_DIR)/bin
 OUTPUT_DIR ?= $(PROJECT_DIR)/test-results
+VENV_DIR ?= $(BIN_DIR)/venv
 export TMP_DIR ?= $(OUTPUT_DIR)/tmp
-export PATH := $(BIN_DIR):$(PATH)
+export PATH := $(BIN_DIR):$(VENV_DIR)/bin:$(PATH)
 export KUBECONFIG ?= $(TMP_DIR)/kubeconfig.yaml
+
+VENV := $(VENV_DIR)/touchfile #file to mark that venv is set up
 
 OS := $(shell go env GOOS)
 ARCH := $(shell go env GOARCH)
@@ -23,8 +26,8 @@ IMG_TAG ?= latest
 # Python linter
 PYLINT = python3 -m pylint
 PYLINTFLAGS = -rn
-PYTHONFILES := $(shell find $(PROJECT_DIR) -type f -name "*.py" -not -path "$(PROJECT_DIR)/.*/*" -not -path "*/test_*.py")
-PYTHONTESTFILES := $(shell find $(PROJECT_DIR) -type f -name "test_*.py" -not -path "$(PROJECT_DIR)/.*/*")
+PYTHONFILES := $(shell find $(PROJECT_DIR) -type f -name "*.py" -not -path "$(PROJECT_DIR)/.*/*" -not -path "*/test_*.py" -not -path "$(BIN_DIR)/*")
+PYTHONTESTFILES := $(shell find $(PROJECT_DIR) -type f -name "test_*.py" -not -path "$(PROJECT_DIR)/.*/*" -not -path "$(BIN_DIR)/*")
 
 ##@ General
 
@@ -46,10 +49,10 @@ help: ## Display this help.
 ##@ Development
 
 .PHONY: lint
-lint: $(patsubst %.py,%.pylint,$(PYTHONFILES)) ## Lint Python files
+lint: $(VENV) $(patsubst %.py,%.pylint,$(PYTHONFILES)) ## Lint Python files
 
 .PHONY: fmt ## Format Python files
-fmt:
+fmt: $(VENV)
 	python3 -m black --quiet $(PYTHONFILES) $(PYTHONTESTFILES)
 
 ##@ Testing
@@ -57,12 +60,12 @@ fmt:
 .PHONY: test
 test: test-nuodb-operations test-config-watcher ## Run tests
 
-test-config-watcher: test-setup
+test-config-watcher: test-setup $(VENV)
 	cd config_watcher \
 		&& python3 -m pytest \
 			--junitxml $(OUTPUT_DIR)/reports/config_watcher.xml
 
-test-nuodb-operations:
+test-nuodb-operations: $(VENV)
 	cd nuodb-operations \
 		&& python3 -m pytest \
 			--junitxml $(OUTPUT_DIR)/reports/nuodb-operations.xml
@@ -79,6 +82,11 @@ test-teardown: $(KWOKCTL) ## Run tests teardown
 .PHONY: docker-build
 docker-build: ## Build NuoDB sidecar docker image.
 	IMG_REPO="$(IMG_REPO)" IMG_TAG="$(IMG_TAG)" ./docker/build.sh
+
+$(VENV): nuodb-operations/test-requirements.txt config_watcher/test-requirements.txt config_watcher/requirements.txt
+	python3 -m venv $(VENV_DIR)
+	pip3 install -r nuodb-operations/test-requirements.txt -r config_watcher/test-requirements.txt -r config_watcher/requirements.txt --ignore-installed 
+	touch $(VENV)
 
 $(KUBECTL):
 	mkdir -p bin

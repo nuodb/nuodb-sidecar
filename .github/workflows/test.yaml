@@ -24,11 +24,6 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'
-      - name: Install dependencies
-        run: |
-          pip install -r nuodb-operations/test-requirements.txt
-          pip install -r config_watcher/test-requirements.txt
-          pip install -r config_watcher/requirements.txt
       - name: Test code formatting
         run: |
           make fmt
