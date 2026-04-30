@@ -402,7 +402,7 @@ def get_backup_timeout(payload):
             return int(payload.get("timeout"))
         except ValueError as e:
             raise UserError("Invalid request timeout") from e
-    if FREEZE_TIMEOUT:
+    if FREEZE_TIMEOUT and JOURNAL_DIR:
         return int(FREEZE_TIMEOUT)
 
 
