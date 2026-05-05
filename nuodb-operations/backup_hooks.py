@@ -9,12 +9,15 @@ import subprocess
 import sys
 import time
 import urllib
-import wsgiref
-from wsgiref import simple_server
+import wsgiref.util
 from threading import Timer
 from shutil import which, disk_usage
 
+import werkzeug
+
 from metrics import Gauge, Histogram, REGISTRY
+from handler_common import HttpError, UserError
+import cores
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 LOGGER = logging.getLogger(__name__)
@@ -414,18 +417,6 @@ class ArchivingNotPausedError(subprocess.CalledProcessError):
         return self.output.decode("utf-8").strip()
 
 
-class HttpError(RuntimeError):
-    def __init__(self, status, message):
-        super().__init__(message)
-        self.status = status
-        self.message = message
-
-
-class UserError(HttpError):
-    def __init__(self, message):
-        super().__init__(http.HTTPStatus.BAD_REQUEST, message)
-
-
 def log_error(exc):
     if isinstance(exc, subprocess.CalledProcessError):
         stdout = exc.stdout.decode("utf-8")
@@ -494,6 +485,7 @@ def get_builtin_handlers():
     handlers = list(COMMON_HANDLERS)
     if has_archive():
         handlers += SM_HANDLERS
+    handlers += cores.cores_handlers()
     return handlers
 
 
@@ -615,7 +607,12 @@ def handle_method(req):
             # Make sure the correct number of parameters were supplied by
             # inspecting method signature
             args = req.components[1:]
-            pos_args = inspect.getfullargspec(handler).args
+            handler_spec = inspect.getfullargspec(handler)
+            pos_args = handler_spec.args
+            if handler_spec.defaults:
+                min_args = len(pos_args) - len(handler_spec.defaults)
+            else:
+                min_args = len(pos_args)
             # If `payload` is in the method signature, then read the request
             # payload as JSON and pass it at the corresponding index
             if "payload" in pos_args:
@@ -631,9 +628,12 @@ def handle_method(req):
             # index
             if "query" in pos_args:
                 args.insert(pos_args.index("query"), req.query_params)
-            if len(args) != len(pos_args):
-                msg = "{} parameter(s) expected but {} supplied in request {}".format(
-                    len(pos_args), len(args), req.parsed.path
+            if len(args) < min_args or len(args) > len(pos_args):
+                msg = (
+                    "Between {} and {} parameter(s) expected but "
+                    "{} supplied in request {}".format(
+                        min_args, len(pos_args), len(args), req.parsed.path
+                    )
                 )
                 if "payload" in pos_args or "query" in pos_args:
                     msg += ", including payload and query parameters"
@@ -645,9 +645,12 @@ def handle_method(req):
     raise UserError("No handler found for path " + req.parsed.path)
 
 
-def create_response(start_response, status, data=None):
+def create_response(environ, start_response, status, data=None):
     status_str = "{0.value} {0.phrase}".format(status)
     headers = []
+    if isinstance(data, os.PathLike):
+        resp = werkzeug.utils.send_file(data, environ)
+        return resp(environ, start_response)
     if isinstance(data, bytes):
         # If data can be decoded as JSON, use application/json
         try:
@@ -741,12 +744,12 @@ class HooksHandler(object):
 
     def __call__(self, environ, start_response):
         status, json_response = self.handle(environ)
-        return create_response(start_response, status, json_response)
+        return create_response(environ, start_response, status, json_response)
 
 
 def start_server(port, handler_config):
     hooks_handler = HooksHandler(handler_config)
-    with simple_server.make_server("", port, hooks_handler) as httpd:
+    with werkzeug.serving.make_server("", port, hooks_handler, threaded=True) as httpd:
         LOGGER.info("Starting backup hooks server on port %s", port)
         httpd.serve_forever()
 
