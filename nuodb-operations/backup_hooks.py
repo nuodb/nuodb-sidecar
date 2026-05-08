@@ -438,12 +438,12 @@ def create_error(exc):
 
 
 SM_HANDLERS = [
-    ("POST", "pre-backup", pre_backup),
-    ("POST", "post-backup", post_backup),
+    ("POST", "pre-backup", [pre_backup]),
+    ("POST", "post-backup", [post_backup]),
 ]
 
 COMMON_HANDLERS = [
-    ("GET", "metrics", lambda: REGISTRY.collect()),  # pylint: disable=W0108
+    ("GET", "metrics", [lambda: REGISTRY.collect()]),  # pylint: disable=W0108
 ]
 
 
@@ -602,44 +602,45 @@ class RequestInfo(object):  # pylint: disable=too-few-public-methods
 
 def handle_method(req):
     # Find a handler that matches the request
-    for method, path_prefix, handler in get_builtin_handlers():
+    for method, path_prefix, handlers in get_builtin_handlers():
         if req.method == method and req.components[0] == path_prefix:
             # Make sure the correct number of parameters were supplied by
             # inspecting method signature
-            args = req.components[1:]
-            handler_spec = inspect.getfullargspec(handler)
-            pos_args = handler_spec.args
-            if handler_spec.defaults:
-                min_args = len(pos_args) - len(handler_spec.defaults)
-            else:
-                min_args = len(pos_args)
-            # If `payload` is in the method signature, then read the request
-            # payload as JSON and pass it at the corresponding index
-            if "payload" in pos_args:
-                try:
-                    decoded_payload = json.loads(req.payload) if req.payload else None
-                    args.insert(pos_args.index("payload"), decoded_payload)
-                except json.JSONDecodeError as e:
-                    raise UserError(  # pylint: disable=raise-missing-from
-                        "Unable to decode request payload: " + str(e)
-                    )
-            # If `query` is in the method signature, then parse the query
-            # parameters as a dictionary and pass them at the corresponding
-            # index
-            if "query" in pos_args:
-                args.insert(pos_args.index("query"), req.query_params)
-            if len(args) < min_args or len(args) > len(pos_args):
-                msg = (
-                    "Between {} and {} parameter(s) expected but "
-                    "{} supplied in request {}".format(
-                        min_args, len(pos_args), len(args), req.parsed.path
-                    )
+            min_args = float("inf")
+            max_args = -1
+            for handler in handlers:
+                # Make a fresh copy of the request components on each iteration since we modify it
+                args = req.components[1:]
+                pos_args = inspect.getfullargspec(handler).args
+                # If `payload` is in the method signature, then read the request
+                # payload as JSON and pass it at the corresponding index
+                if "payload" in pos_args:
+                    try:
+                        decoded_payload = (
+                            json.loads(req.payload) if req.payload else None
+                        )
+                        args.insert(pos_args.index("payload"), decoded_payload)
+                    except json.JSONDecodeError as e:
+                        raise UserError(  # pylint: disable=raise-missing-from
+                            "Unable to decode request payload: " + str(e)
+                        )
+                # If `query` is in the method signature, then parse the query
+                # parameters as a dictionary and pass them at the corresponding
+                # index
+                if "query" in pos_args:
+                    args.insert(pos_args.index("query"), req.query_params)
+                if len(args) == len(pos_args):
+                    # Request is valid. Send it to handler.
+                    return path_prefix, handler(*args)
+                min_args = min(min_args, len(pos_args))
+                max_args = max(max_args, len(pos_args))
+            msg = (
+                "Between {} and {} parameter(s) expected but "
+                "{} supplied in request {}, including payload and query parameters".format(
+                    min_args, max_args, len(args), req.parsed.path
                 )
-                if "payload" in pos_args or "query" in pos_args:
-                    msg += ", including payload and query parameters"
-                raise UserError(msg)
-            # Request is valid. Send it to handler.
-            return path_prefix, handler(*args)
+            )
+            raise UserError(msg)
 
     # Handler was not found
     raise UserError("No handler found for path " + req.parsed.path)
@@ -688,14 +689,15 @@ class HooksHandler(object):
                 "No archive dir found, not configuring certain built-in handlers."
             )
 
-        for method, path_prefix, handler in get_builtin_handlers():
+        for method, path_prefix, handlers in get_builtin_handlers():
             path = path_prefix
-            for arg in inspect.getfullargspec(handler).args:
-                if arg not in ["payload", "query"]:
-                    path += "/{" + arg + "}"
-            builtin_handlers.append(
-                "{}{} /{}".format(indent * " ", method, normalize_path(path))
-            )
+            for handler in handlers:
+                for arg in inspect.getfullargspec(handler).args:
+                    if arg not in ["payload", "query"]:
+                        path += "/{" + arg + "}"
+                builtin_handlers.append(
+                    "{}{} /{}".format(indent * " ", method, normalize_path(path))
+                )
         if builtin_handlers:
             LOGGER.info("Built-in handlers:\n%s", "\n".join(builtin_handlers))
         else:

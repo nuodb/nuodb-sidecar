@@ -1,6 +1,7 @@
 import http
 import os
 from pathlib import Path
+from typing import Any
 from werkzeug.security import safe_join
 from handler_common import HttpError, UserError
 
@@ -10,25 +11,27 @@ CORES_DIR = os.environ.get("NUODB_CORES_DIR", "/mnt/log")
 
 def cores_handlers() -> list[tuple[str, str, callable]]:
     "Get /cores handlers"
-    return [("GET", "cores", handle), ("DELETE", "cores", delete_core)]
+    return [
+        ("GET", "cores", [list_cores, get_core]),
+        ("DELETE", "cores", [delete_core]),
+    ]
 
 
-def handle(
-    file_dir: str | None = None, file_name: str | None = None
-) -> list[str] | Path:
-    "Handle GET /cores requests"
-    if not file_dir and not file_name:
-        return list_cores()
-
-    return get_core(file_dir, file_name)
-
-
-def list_cores() -> list[str]:
+def list_cores(query: dict[str:Any]) -> list[str]:
     "List available cores"
+    try:
+        after = int(query.get("after", -1))
+    except ValueError as e:
+        raise UserError(
+            f"Query parameter after must be an integer, got {query.get("after")}"
+        ) from e
+
     if not os.path.isdir(CORES_DIR):
         return []
     cores = []
     for core in Path(CORES_DIR).glob("crash*/core*"):
+        if after >= 0 and after >= core.stat().st_mtime:
+            continue
         cores.append(str(core.relative_to(CORES_DIR)))
     return cores
 

@@ -489,8 +489,14 @@ class NoArchivesHandlersTest(HttpHandlersTests):
 
 
 class CoresHandlersTest(HttpHandlersTests):
-    def get_cores(self):
-        resp, data = self.request(method="GET", path=f"/cores/")
+    def get_cores(self, after=None):
+        query_params = []
+        if after:
+            query_params.append(f"after={after}")
+        path = "/cores"
+        if query_params:
+            path = f"{path}?{'&'.join(query_params)}"
+        resp, data = self.request(method="GET", path=path)
         return resp, json.loads(data)
 
     def get_core(self, core_path, range_start="", range_end=""):
@@ -581,6 +587,8 @@ class CoresHandlersTest(HttpHandlersTests):
         os.makedirs(self.path("cores", "crash"))
         Path(self.path("cores", "crash", "core.abc.123")).touch()
         Path(self.path("cores", "crash", "core.abc.456")).touch()
+        time.sleep(1)  # Make sure that the creation time on the cores is different
+        last_core_time = int(time.time())
         os.makedirs(self.path("cores", "crash-789"))
         Path(self.path("cores", "crash-789", "core.abc.210")).touch()
 
@@ -603,8 +611,12 @@ class CoresHandlersTest(HttpHandlersTests):
             "crash/core.abc.456",
         ]
         resp, cores = self.get_cores()
-        self.assertEqual(resp.status, http.HTTPStatus.OK)
+        self.assertEqual(resp.status, http.HTTPStatus.OK, cores)
         self.assertEqual(sorted(cores), expected_cores)
+
+        resp, cores = self.get_cores(after=last_core_time)
+        self.assertEqual(resp.status, http.HTTPStatus.OK, cores)
+        self.assertEqual(cores, ["crash-789/core.abc.210"])
 
         # Test that get and delete also ignore the non-core files
         resp, data = self.get_core("crash-789/nuosm.log")
