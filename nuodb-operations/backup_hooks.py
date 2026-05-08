@@ -9,12 +9,15 @@ import subprocess
 import sys
 import time
 import urllib
-import wsgiref
-from wsgiref import simple_server
+import wsgiref.util
 from threading import Timer
 from shutil import which, disk_usage
 
+import werkzeug
+
 from metrics import Gauge, Histogram, REGISTRY
+from handler_common import HttpError, UserError
+import cores
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 LOGGER = logging.getLogger(__name__)
@@ -414,18 +417,6 @@ class ArchivingNotPausedError(subprocess.CalledProcessError):
         return self.output.decode("utf-8").strip()
 
 
-class HttpError(RuntimeError):
-    def __init__(self, status, message):
-        super().__init__(message)
-        self.status = status
-        self.message = message
-
-
-class UserError(HttpError):
-    def __init__(self, message):
-        super().__init__(http.HTTPStatus.BAD_REQUEST, message)
-
-
 def log_error(exc):
     if isinstance(exc, subprocess.CalledProcessError):
         stdout = exc.stdout.decode("utf-8")
@@ -447,12 +438,12 @@ def create_error(exc):
 
 
 SM_HANDLERS = [
-    ("POST", "pre-backup", pre_backup),
-    ("POST", "post-backup", post_backup),
+    ("POST", "pre-backup", [pre_backup]),
+    ("POST", "post-backup", [post_backup]),
 ]
 
 COMMON_HANDLERS = [
-    ("GET", "metrics", lambda: REGISTRY.collect()),  # pylint: disable=W0108
+    ("GET", "metrics", [lambda: REGISTRY.collect()]),  # pylint: disable=W0108
 ]
 
 
@@ -494,6 +485,7 @@ def get_builtin_handlers():
     handlers = list(COMMON_HANDLERS)
     if has_archive():
         handlers += SM_HANDLERS
+    handlers += cores.cores_handlers()
     return handlers
 
 
@@ -610,44 +602,56 @@ class RequestInfo(object):  # pylint: disable=too-few-public-methods
 
 def handle_method(req):
     # Find a handler that matches the request
-    for method, path_prefix, handler in get_builtin_handlers():
+    for method, path_prefix, handlers in get_builtin_handlers():
         if req.method == method and req.components[0] == path_prefix:
             # Make sure the correct number of parameters were supplied by
             # inspecting method signature
-            args = req.components[1:]
-            pos_args = inspect.getfullargspec(handler).args
-            # If `payload` is in the method signature, then read the request
-            # payload as JSON and pass it at the corresponding index
-            if "payload" in pos_args:
-                try:
-                    decoded_payload = json.loads(req.payload) if req.payload else None
-                    args.insert(pos_args.index("payload"), decoded_payload)
-                except json.JSONDecodeError as e:
-                    raise UserError(  # pylint: disable=raise-missing-from
-                        "Unable to decode request payload: " + str(e)
-                    )
-            # If `query` is in the method signature, then parse the query
-            # parameters as a dictionary and pass them at the corresponding
-            # index
-            if "query" in pos_args:
-                args.insert(pos_args.index("query"), req.query_params)
-            if len(args) != len(pos_args):
-                msg = "{} parameter(s) expected but {} supplied in request {}".format(
-                    len(pos_args), len(args), req.parsed.path
+            min_args = float("inf")
+            max_args = -1
+            for handler in handlers:
+                # Make a fresh copy of the request components on each iteration since we modify it
+                args = req.components[1:]
+                pos_args = inspect.getfullargspec(handler).args
+                # If `payload` is in the method signature, then read the request
+                # payload as JSON and pass it at the corresponding index
+                if "payload" in pos_args:
+                    try:
+                        decoded_payload = (
+                            json.loads(req.payload) if req.payload else None
+                        )
+                        args.insert(pos_args.index("payload"), decoded_payload)
+                    except json.JSONDecodeError as e:
+                        raise UserError(  # pylint: disable=raise-missing-from
+                            "Unable to decode request payload: " + str(e)
+                        )
+                # If `query` is in the method signature, then parse the query
+                # parameters as a dictionary and pass them at the corresponding
+                # index
+                if "query" in pos_args:
+                    args.insert(pos_args.index("query"), req.query_params)
+                if len(args) == len(pos_args):
+                    # Request is valid. Send it to handler.
+                    return path_prefix, handler(*args)
+                min_args = min(min_args, len(pos_args))
+                max_args = max(max_args, len(pos_args))
+            msg = (
+                "Between {} and {} parameter(s) expected but "
+                "{} supplied in request {}, including payload and query parameters".format(
+                    min_args, max_args, len(args), req.parsed.path
                 )
-                if "payload" in pos_args or "query" in pos_args:
-                    msg += ", including payload and query parameters"
-                raise UserError(msg)
-            # Request is valid. Send it to handler.
-            return path_prefix, handler(*args)
+            )
+            raise UserError(msg)
 
     # Handler was not found
     raise UserError("No handler found for path " + req.parsed.path)
 
 
-def create_response(start_response, status, data=None):
+def create_response(environ, start_response, status, data=None):
     status_str = "{0.value} {0.phrase}".format(status)
     headers = []
+    if isinstance(data, os.PathLike):
+        resp = werkzeug.utils.send_file(data, environ)
+        return resp(environ, start_response)
     if isinstance(data, bytes):
         # If data can be decoded as JSON, use application/json
         try:
@@ -685,14 +689,15 @@ class HooksHandler(object):
                 "No archive dir found, not configuring certain built-in handlers."
             )
 
-        for method, path_prefix, handler in get_builtin_handlers():
+        for method, path_prefix, handlers in get_builtin_handlers():
             path = path_prefix
-            for arg in inspect.getfullargspec(handler).args:
-                if arg not in ["payload", "query"]:
-                    path += "/{" + arg + "}"
-            builtin_handlers.append(
-                "{}{} /{}".format(indent * " ", method, normalize_path(path))
-            )
+            for handler in handlers:
+                for arg in inspect.getfullargspec(handler).args:
+                    if arg not in ["payload", "query"]:
+                        path += "/{" + arg + "}"
+                builtin_handlers.append(
+                    "{}{} /{}".format(indent * " ", method, normalize_path(path))
+                )
         if builtin_handlers:
             LOGGER.info("Built-in handlers:\n%s", "\n".join(builtin_handlers))
         else:
@@ -741,12 +746,12 @@ class HooksHandler(object):
 
     def __call__(self, environ, start_response):
         status, json_response = self.handle(environ)
-        return create_response(start_response, status, json_response)
+        return create_response(environ, start_response, status, json_response)
 
 
 def start_server(port, handler_config):
     hooks_handler = HooksHandler(handler_config)
-    with simple_server.make_server("", port, hooks_handler) as httpd:
+    with werkzeug.serving.make_server("", port, hooks_handler, threaded=True) as httpd:
         LOGGER.info("Starting backup hooks server on port %s", port)
         httpd.serve_forever()
 
