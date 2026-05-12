@@ -10,7 +10,7 @@ import sys
 import time
 import urllib
 import wsgiref.util
-from threading import Timer
+from threading import Lock, Timer
 from shutil import which, disk_usage
 
 import werkzeug
@@ -43,6 +43,9 @@ JOURNAL_BACKUP_ID_FILE = from_dir(JOURNAL_DIR, "backup.txt")
 BACKUP_PAYLOAD_FILE = from_dir(ARCHIVE_DIR, "backup_payload.txt")
 BACKUP_START_ID_FILE = from_dir(ARCHIVE_DIR, "backup_sid.txt")
 RESTORED_FILE = from_dir(ARCHIVE_DIR, "restored.txt")
+
+# The pre- and post-backup hooks are not thread safe, so create a mutex for them
+backup_hooks_lock = Lock()
 
 VOLUME_AVAILABLE_BYTES = Gauge(
     "nuodb_volume_available_bytes",
@@ -237,72 +240,73 @@ def pre_backup(backup_id, payload):
     if not backup_id:
         raise UserError("Backup ID not specified")
 
-    # Get nuodb processes
-    processes = get_nuodb_process_info()
-    if not processes:
-        raise RuntimeError("No nuodb process found")
+    with backup_hooks_lock:
+        # Get nuodb processes
+        processes = get_nuodb_process_info()
+        if not processes:
+            raise RuntimeError("No nuodb process found")
 
-    # Make sure we do not attempt to execute pre-backup hook if a backup is
-    # already in progress, which may block indefinitely if writes to the
-    # archive and journal directories are frozen
-    if os.path.exists(ARCHIVE_BACKUP_ID_FILE):
-        # Check if the SM process was restarted which will invalidate the
-        # previous pre-backup operation using HotSnap.
-        stored_start_id = get_start_id()
-        if (
-            FREEZE_MODE != MODE_FSFREEZE
-            and stored_start_id
-            and processes[0]["sid"] != stored_start_id
-        ):
-            # Remote the backup files from the previous pre-backup operation
-            LOGGER.warning(
-                "Unexpected start ID: current=%s, stored=%s. "
-                + "SM process restarted while executing backup ID %s.",
-                processes[0]["sid"],
-                stored_start_id,
-                get_backup_id(),
-            )
-            remove_backup_files()
-        else:
-            raise UserError(
-                f"Backup ID file {ARCHIVE_BACKUP_ID_FILE} exists. "
-                + "Execute post-backup hook to complete current backup."
-            )
-    # Get timeout for the operation if specified
-    timeout = get_backup_timeout(payload)
+        # Make sure we do not attempt to execute pre-backup hook if a backup is
+        # already in progress, which may block indefinitely if writes to the
+        # archive and journal directories are frozen
+        if os.path.exists(ARCHIVE_BACKUP_ID_FILE):
+            # Check if the SM process was restarted which will invalidate the
+            # previous pre-backup operation using HotSnap.
+            stored_start_id = get_start_id()
+            if (
+                FREEZE_MODE != MODE_FSFREEZE
+                and stored_start_id
+                and processes[0]["sid"] != stored_start_id
+            ):
+                # Remote the backup files from the previous pre-backup operation
+                LOGGER.warning(
+                    "Unexpected start ID: current=%s, stored=%s. "
+                    + "SM process restarted while executing backup ID %s.",
+                    processes[0]["sid"],
+                    stored_start_id,
+                    get_backup_id(),
+                )
+                remove_backup_files()
+            else:
+                raise UserError(
+                    f"Backup ID file {ARCHIVE_BACKUP_ID_FILE} exists. "
+                    + "Execute post-backup hook to complete current backup."
+                )
+        # Get timeout for the operation if specified
+        timeout = get_backup_timeout(payload)
 
-    # Delete file that is used by restored database to signal that archive
-    # preparation is complete. This may be present if this database was
-    # restored from a backup and this is the first time that a backup has been
-    # taken on it.
-    if os.path.exists(RESTORED_FILE):
-        os.remove(RESTORED_FILE)
+        # Delete file that is used by restored database to signal that archive
+        # preparation is complete. This may be present if this database was
+        # restored from a backup and this is the first time that a backup has been
+        # taken on it.
+        if os.path.exists(RESTORED_FILE):
+            os.remove(RESTORED_FILE)
 
-    # Write the start_id of the SM to a file
-    write_file(BACKUP_START_ID_FILE, processes[0]["sid"])
+        # Write the start_id of the SM to a file
+        write_file(BACKUP_START_ID_FILE, processes[0]["sid"])
 
-    # Write backup ID to archive directory
-    write_file(ARCHIVE_BACKUP_ID_FILE, backup_id)
+        # Write backup ID to archive directory
+        write_file(ARCHIVE_BACKUP_ID_FILE, backup_id)
 
-    # Write backup ID to journal directory if it is separate from archive
-    if JOURNAL_DIR is not None:
-        write_file(JOURNAL_BACKUP_ID_FILE, backup_id)
+        # Write backup ID to journal directory if it is separate from archive
+        if JOURNAL_DIR is not None:
+            write_file(JOURNAL_BACKUP_ID_FILE, backup_id)
 
-    # Write opaque data in request payload that should be backed up
-    # (snapshotted) with archive
-    if payload is not None and payload.get("opaque"):
-        write_file(BACKUP_PAYLOAD_FILE, payload["opaque"])
-    elif os.path.exists(BACKUP_PAYLOAD_FILE):
-        # Remove opaque data from last backup
-        os.remove(BACKUP_PAYLOAD_FILE)
+        # Write opaque data in request payload that should be backed up
+        # (snapshotted) with archive
+        if payload is not None and payload.get("opaque"):
+            write_file(BACKUP_PAYLOAD_FILE, payload["opaque"])
+        elif os.path.exists(BACKUP_PAYLOAD_FILE):
+            # Remove opaque data from last backup
+            os.remove(BACKUP_PAYLOAD_FILE)
 
-    # If the archive and journal are on separate volumes, block writes to the
-    # archive to allow consistent snapshots to be obtained of both
-    if JOURNAL_DIR is not None:
-        freeze_archive(backup_id, processes, timeout=timeout)
+        # If the archive and journal are on separate volumes, block writes to the
+        # archive to allow consistent snapshots to be obtained of both
+        if JOURNAL_DIR is not None:
+            freeze_archive(backup_id, processes, timeout=timeout)
 
-    # Cancel backup operation after specified timeout
-    schedule_cancellation(backup_id, timeout)
+        # Cancel backup operation after specified timeout
+        schedule_cancellation(backup_id, timeout)
 
 
 def schedule_cancellation(backup_id, timeout):
@@ -332,43 +336,44 @@ def post_backup(backup_id, query):
 
     # Check backup ID to make sure it matches current backup
     force = query is not None and query.get("force") in [True, "true"]
-    current_backup_id = get_backup_id()
-    if current_backup_id != backup_id:
-        msg = "Unexpected backup ID: current={}, supplied={}".format(
-            current_backup_id, backup_id
-        )
-        # If force=true, then do not fail on mismatching backup ID
-        if force:
-            LOGGER.warning(msg)
-        else:
-            raise UserError(msg)
+    with backup_hooks_lock:
+        current_backup_id = get_backup_id()
+        if current_backup_id != backup_id:
+            msg = "Unexpected backup ID: current={}, supplied={}".format(
+                current_backup_id, backup_id
+            )
+            # If force=true, then do not fail on mismatching backup ID
+            if force:
+                LOGGER.warning(msg)
+            else:
+                raise UserError(msg)
 
-    # Get backup file creation timestamp
-    ctime = get_backup_ctime()
-    # Get nuodb processes
-    processes = get_nuodb_process_info()
-    if not processes:
-        raise RuntimeError("No nuodb process found")
+        # Get backup file creation timestamp
+        ctime = get_backup_ctime()
+        # Get nuodb processes
+        processes = get_nuodb_process_info()
+        if not processes:
+            raise RuntimeError("No nuodb process found")
 
-    # If the archive and journal are on separate volumes, we must unblock
-    # writes to the archive
-    if JOURNAL_DIR is not None:
-        try:
-            freeze_archive(backup_id, processes, unfreeze=True)
-        except ArchivingNotPausedError:
-            # Delete backup metadata files to allow new backups
-            remove_backup_files()
-            # Record the snapshot duration even if the database archiving was
-            # already resumed due to internal engine timeout
-            if ctime:
-                BACKUP_DURATION_SECONDS.observe(time.time() - ctime)
-            raise
+        # If the archive and journal are on separate volumes, we must unblock
+        # writes to the archive
+        if JOURNAL_DIR is not None:
+            try:
+                freeze_archive(backup_id, processes, unfreeze=True)
+            except ArchivingNotPausedError:
+                # Delete backup metadata files to allow new backups
+                remove_backup_files()
+                # Record the snapshot duration even if the database archiving was
+                # already resumed due to internal engine timeout
+                if ctime:
+                    BACKUP_DURATION_SECONDS.observe(time.time() - ctime)
+                raise
 
-    # Delete backup metadata files
-    remove_backup_files()
-    # Record the total duration of the snapshot operation
-    if ctime:
-        BACKUP_DURATION_SECONDS.observe(time.time() - ctime)
+        # Delete backup metadata files
+        remove_backup_files()
+        # Record the total duration of the snapshot operation
+        if ctime:
+            BACKUP_DURATION_SECONDS.observe(time.time() - ctime)
 
 
 def remove_backup_files():
@@ -606,8 +611,7 @@ def handle_method(req):
         if req.method == method and req.components[0] == path_prefix:
             # Make sure the correct number of parameters were supplied by
             # inspecting method signature
-            min_args = float("inf")
-            max_args = -1
+            arg_count = set()
             for handler in handlers:
                 # Make a fresh copy of the request components on each iteration since we modify it
                 args = req.components[1:]
@@ -632,12 +636,22 @@ def handle_method(req):
                 if len(args) == len(pos_args):
                     # Request is valid. Send it to handler.
                     return path_prefix, handler(*args)
-                min_args = min(min_args, len(pos_args))
-                max_args = max(max_args, len(pos_args))
+                arg_count.add(len(pos_args))
+            sorted_counts = sorted(arg_count)
+            if len(sorted_counts) == 0:
+                LOGGER.error("No handlers found for path %s", path_prefix)
+                continue
+            if len(sorted_counts) == 1:
+                human_readable_args = str(sorted_counts[0])
+            elif len(sorted_counts) == 2:
+                human_readable_args = f"{sorted_counts[0]} or {sorted_counts[1]}"
+            else:
+                human_readable_args = ", ".join(map(str, sorted_counts[:-1]))
+                human_readable_args = f"{human_readable_args}, or {sorted_counts[-1]}"
             msg = (
-                "Between {} and {} parameter(s) expected but "
+                "{} parameter(s) expected but "
                 "{} supplied in request {}, including payload and query parameters".format(
-                    min_args, max_args, len(args), req.parsed.path
+                    human_readable_args, len(args), req.parsed.path
                 )
             )
             raise UserError(msg)
@@ -650,7 +664,7 @@ def create_response(environ, start_response, status, data=None):
     status_str = "{0.value} {0.phrase}".format(status)
     headers = []
     if isinstance(data, os.PathLike):
-        resp = werkzeug.utils.send_file(data, environ)
+        resp = werkzeug.utils.send_file(data, environ, as_attachment=True)
         return resp(environ, start_response)
     if isinstance(data, bytes):
         # If data can be decoded as JSON, use application/json

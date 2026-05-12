@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -94,9 +95,9 @@ class HttpHandlersTests(unittest.TestCase):
             os.makedirs(self.journal_dir)
             os.environ["NUODB_JOURNAL_DIR"] = self.journal_dir
         if server_config.get("has_cores", True):
-            self.cores_dir = os.path.join(self.test_dir, "cores")
-            os.makedirs(self.cores_dir)
-            os.environ["NUODB_CORES_DIR"] = self.cores_dir
+            self.logs_dir = os.path.join(self.test_dir, "cores")
+            os.makedirs(self.logs_dir)
+            os.environ["NUODB_LOGDIR"] = self.logs_dir
         # Configure custom handlers
         handler_config = None
         custom_handlers = server_config.get("custom_handlers")
@@ -287,6 +288,124 @@ class HttpHandlersTests(unittest.TestCase):
             'hook_request_duration_seconds_sum{method="GET",endpoint="/exit",http_status="400"}',
             out,
         )
+
+    @mock.patch("backup_hooks.get_builtin_handlers")
+    def testMultiHandlerPath(self, mock_handlers):
+        def no_argument_function():
+            return "no_argument_function was called"
+
+        def single_argument_function(arg1):
+            return f"single_argument_function was called {arg1}"
+
+        def three_argument_function(arg1, arg2, arg3):
+            return f"three_argument_function was called {arg1} {arg2} {arg3}"
+
+        mock_handlers.return_value = [
+            ("GET", "singlepath", [no_argument_function]),
+            ("GET", "multipath", [three_argument_function, single_argument_function]),
+            (
+                "GET",
+                "allpath",
+                [
+                    three_argument_function,
+                    single_argument_function,
+                    no_argument_function,
+                ],
+            ),
+            ("GET", "nonepath", []),
+        ]
+
+        # Test a path with only one handler
+        test_path = "/singlepath/foo"
+        resp, data = self.request(method="GET", path=test_path)
+        self.assertEqual(http.HTTPStatus.BAD_REQUEST, resp.status, str(data))
+        data = json.loads(data)
+        self.assertFalse(data["success"])
+        self.assertEqual(
+            data["message"],
+            f"0 parameter(s) expected but 1 supplied in request {test_path}, including payload and query parameters",
+        )
+
+        resp, data = self.request(method="GET", path="/singlepath")
+        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+        data = json.loads(data)
+        self.assertEqual(data, "no_argument_function was called")
+
+        # Test path with multiple handlers, starting with bad argument counts
+        test_path = "/multipath"
+        resp, data = self.request(method="GET", path=test_path)
+        self.assertEqual(http.HTTPStatus.BAD_REQUEST, resp.status, str(data))
+        data = json.loads(data)
+        self.assertFalse(data["success"])
+        self.assertEqual(
+            data["message"],
+            f"1 or 3 parameter(s) expected but 0 supplied in request {test_path}, including payload and query parameters",
+        )
+
+        test_path = "/multipath/one/two"
+        resp, data = self.request(method="GET", path=test_path)
+        self.assertEqual(http.HTTPStatus.BAD_REQUEST, resp.status, str(data))
+        data = json.loads(data)
+        self.assertFalse(data["success"])
+        self.assertEqual(
+            data["message"],
+            f"1 or 3 parameter(s) expected but 2 supplied in request {test_path}, including payload and query parameters",
+        )
+
+        test_path = "/multipath/one/two/three/four"
+        resp, data = self.request(method="GET", path=test_path)
+        self.assertEqual(http.HTTPStatus.BAD_REQUEST, resp.status, str(data))
+        data = json.loads(data)
+        self.assertFalse(data["success"])
+        self.assertEqual(
+            data["message"],
+            f"1 or 3 parameter(s) expected but 4 supplied in request {test_path}, including payload and query parameters",
+        )
+
+        # And test that the happy case still works
+        resp, data = self.request(method="GET", path="/multipath/one")
+        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+        data = json.loads(data)
+        self.assertEqual(data, "single_argument_function was called one")
+
+        resp, data = self.request(method="GET", path="/multipath/one/two/three")
+        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+        data = json.loads(data)
+        self.assertEqual(data, "three_argument_function was called one two three")
+
+        # Test a path with lots of handlers
+        test_path = "/allpath/one/two"
+        resp, data = self.request(method="GET", path=test_path)
+        self.assertEqual(http.HTTPStatus.BAD_REQUEST, resp.status, str(data))
+        data = json.loads(data)
+        self.assertFalse(data["success"])
+        self.assertEqual(
+            data["message"],
+            f"0, 1, or 3 parameter(s) expected but 2 supplied in request {test_path}, including payload and query parameters",
+        )
+
+        resp, data = self.request(method="GET", path="/allpath")
+        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+        data = json.loads(data)
+        self.assertEqual(data, "no_argument_function was called")
+
+        resp, data = self.request(method="GET", path="/allpath/one")
+        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+        data = json.loads(data)
+        self.assertEqual(data, "single_argument_function was called one")
+
+        resp, data = self.request(method="GET", path="/allpath/one/two/three")
+        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+        data = json.loads(data)
+        self.assertEqual(data, "three_argument_function was called one two three")
+
+        # Test the case of a path with no handler
+        test_path = "/nonepath"
+        resp, data = self.request(method="GET", path=test_path)
+        self.assertEqual(http.HTTPStatus.BAD_REQUEST, resp.status, str(data))
+        data = json.loads(data)
+        self.assertFalse(data["success"])
+        self.assertEqual(data["message"], f"No handler found for path {test_path}")
 
 
 class BackupHooksTest(HttpHandlersTests):
@@ -492,7 +611,7 @@ class CoresHandlersTest(HttpHandlersTests):
     def get_cores(self, after=None):
         query_params = []
         if after:
-            query_params.append(f"after={after}")
+            query_params.append(f"modifiedAfterEpochSec={after}")
         path = "/cores"
         if query_params:
             path = f"{path}?{'&'.join(query_params)}"
@@ -517,21 +636,21 @@ class CoresHandlersTest(HttpHandlersTests):
         "Test that the handler can gracefully handle not having a cores directory."
 
         self.assertNotIn(
-            "NUODB_CORES_DIR",
+            "NUODB_LOGDIR",
             os.environ,
-            "TEST ERROR: NUODB_CORES_DIR should not be set",
+            "TEST ERROR: NUODB_LOGDIR should not be set",
         )
         resp, cores = self.get_cores()
         self.assertEqual(resp.status, http.HTTPStatus.OK)
         self.assertEqual(cores, [])
 
-        resp, data = self.get_core("crash/core.abc.123")
+        resp, data = self.get_core("core.nuodb.abc.123")
         self.assertEqual(resp.status, http.HTTPStatus.NOT_FOUND)
         data = json.loads(data)
         self.assertFalse(data["success"])
         self.assertEqual(data["message"], "File not found")
 
-        resp, data = self.delete_core("crash/core.abc.123")
+        resp, data = self.delete_core("core.nuodb.abc.123")
         self.assertEqual(resp.status, http.HTTPStatus.NOT_FOUND)
         self.assertFalse(data["success"])
         self.assertEqual(data["message"], "File not found")
@@ -543,21 +662,29 @@ class CoresHandlersTest(HttpHandlersTests):
         self.assertEqual(resp.status, http.HTTPStatus.OK)
         self.assertEqual(cores, [])
 
+        core_name = "core.nuodb.abc.123"
         file_contents = b"The file contents that we expect to be there."
-        core_file_path = self.path("cores", "crash", "core.abc.123")
+        core_file_path = self.path("cores", "crash", core_name)
         os.makedirs(os.path.dirname(core_file_path))
+        ts_before = int(time.time())
         with open(core_file_path, "wb") as f:
             f.write(file_contents)
+        ts_after = time.time()
 
-        core_name = "crash/core.abc.123"
         resp, cores = self.get_cores()
         self.assertEqual(resp.status, http.HTTPStatus.OK)
-        self.assertEqual(cores, [core_name])
+        self.assertEqual(len(cores), 1)
+        name, timestamp, filehash = cores[0]
+        self.assertEqual(name, core_name)
+        self.assertGreaterEqual(timestamp, ts_before)
+        self.assertLessEqual(timestamp, ts_after)
+        self.assertEqual(filehash, hashlib.sha1(file_contents).hexdigest())
 
         resp, core = self.get_core(core_name)
         self.assertEqual(resp.status, http.HTTPStatus.OK)
         self.assertEqual(int(resp.getheader("Content-Length")), len(file_contents))
         self.assertEqual(resp.getheader("Accept-Ranges"), "bytes")
+        self.assertIn("attachment", resp.getheader("Content-Disposition"))
         self.assertEqual(core, file_contents)
 
         resp, data = self.delete_core(core_name)
@@ -584,51 +711,65 @@ class CoresHandlersTest(HttpHandlersTests):
         self.assertEqual(cores, [])
 
         # Create some cores
+        ts_before = int(time.time())
         os.makedirs(self.path("cores", "crash"))
-        Path(self.path("cores", "crash", "core.abc.123")).touch()
-        Path(self.path("cores", "crash", "core.abc.456")).touch()
-        time.sleep(1)  # Make sure that the creation time on the cores is different
+        Path(self.path("cores", "crash", "core.nuodb.abc.123")).touch()
+        Path(self.path("cores", "crash", "core.nuodb.abc.456")).touch()
+        time.sleep(1)  # Make sure that the creation time on the last core is different
         last_core_time = int(time.time())
-        os.makedirs(self.path("cores", "crash-789"))
-        Path(self.path("cores", "crash-789", "core.abc.210")).touch()
+        os.makedirs(self.path("cores", "crash-789T123"))
+        Path(self.path("cores", "crash-789T123", "core.nuodb.abc.210")).touch()
+        ts_after = time.time()
 
         # Add some other files that are not cores and should not show up
         Path(self.path("cores", "nuosm.log")).touch()  # Not a core
         Path(
-            self.path("cores", "core.abc.123")
+            self.path("cores", "core.nuodb.abc.123")
         ).touch()  # Core outside a crash directory
         Path(
-            self.path("cores", "crash-789", "nuosm.log")
+            self.path("cores", "crash-789T123", "nuosm.log")
         ).touch()  # Non-core file in a crash directory
         os.makedirs(self.path("cores", "nuosm.log.1"))
         Path(
-            self.path("cores", "nuosm.log.1", "core.abc.210")
+            self.path("cores", "nuosm.log.1", "core.nuodb.abc.666")
         ).touch()  # Core not in a valid directory
 
         expected_cores = [
-            "crash-789/core.abc.210",
-            "crash/core.abc.123",
-            "crash/core.abc.456",
+            "789T123-core.nuodb.abc.210",
+            "core.nuodb.abc.123",
+            "core.nuodb.abc.456",
         ]
+        expected_hash = hashlib.sha1(b"").hexdigest()
         resp, cores = self.get_cores()
         self.assertEqual(resp.status, http.HTTPStatus.OK, cores)
-        self.assertEqual(sorted(cores), expected_cores)
+        self.assertEqual(len(cores), len(expected_cores))
+        for i, core in enumerate(cores):
+            name, timestamp, filehash = core
+            self.assertEqual(name, expected_cores[i])
+            self.assertGreaterEqual(timestamp, ts_before)
+            self.assertLessEqual(timestamp, ts_after)
+            self.assertEqual(filehash, expected_hash)
 
         resp, cores = self.get_cores(after=last_core_time)
         self.assertEqual(resp.status, http.HTTPStatus.OK, cores)
-        self.assertEqual(cores, ["crash-789/core.abc.210"])
+        self.assertEqual(len(cores), 1)
+        name, timestamp, filehash = cores[0]
+        self.assertEqual(name, "789T123-core.nuodb.abc.210")
+        self.assertGreaterEqual(timestamp, last_core_time)
+        self.assertLessEqual(timestamp, ts_after)
+        self.assertEqual(filehash, expected_hash)
 
         # Test that get and delete also ignore the non-core files
-        resp, data = self.get_core("crash-789/nuosm.log")
+        resp, data = self.get_core("nuosm.log")
         self.assertEqual(resp.status, http.HTTPStatus.BAD_REQUEST)
         data = json.loads(data)
         self.assertFalse(data["success"])
         self.assertEqual(data["message"], "Invalid core")
 
-        resp, data = self.delete_core("nuosm.log.1/core.abc.210")
-        self.assertEqual(resp.status, http.HTTPStatus.BAD_REQUEST)
+        resp, data = self.delete_core("core.nuodb.abc.666")
+        self.assertEqual(resp.status, http.HTTPStatus.NOT_FOUND)
         self.assertFalse(data["success"])
-        self.assertEqual(data["message"], "Invalid core")
+        self.assertEqual(data["message"], "File not found")
 
     def testFilePagination(self):
         "Test fetching a file in chunks."
@@ -645,15 +786,23 @@ class CoresHandlersTest(HttpHandlersTests):
         """
             * 10
         )
-        core_file_path = self.path("cores", "crash-20260505T130153", "core.abc.123")
+        file_name = "core.nuodb.abc.123"
+        core_name = "20260505T130153-" + file_name
+        core_file_path = self.path("cores", "crash-20260505T130153", file_name)
         os.makedirs(os.path.dirname(core_file_path))
+        ts_before = int(time.time())
         with open(core_file_path, "wb") as f:
             f.write(file_contents)
+        ts_after = time.time()
 
-        core_name = "crash-20260505T130153/core.abc.123"
         resp, cores = self.get_cores()
         self.assertEqual(resp.status, http.HTTPStatus.OK)
-        self.assertEqual(cores, [core_name])
+        self.assertEqual(len(cores), 1)
+        name, timestamp, filehash = cores[0]
+        self.assertEqual(name, core_name)
+        self.assertGreaterEqual(timestamp, ts_before)
+        self.assertLessEqual(timestamp, ts_after)
+        self.assertEqual(filehash, hashlib.sha1(file_contents).hexdigest())
 
         pagesize = 100
         for page_start in range(0, len(file_contents), pagesize):
