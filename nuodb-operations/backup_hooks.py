@@ -449,7 +449,7 @@ SM_HANDLERS = [
 
 COMMON_HANDLERS = [
     ("GET", "metrics", [lambda: REGISTRY.collect()]),  # pylint: disable=W0108
-]
+] + cores.cores_handlers()
 
 
 def get_payload(environ):
@@ -490,7 +490,6 @@ def get_builtin_handlers():
     handlers = list(COMMON_HANDLERS)
     if has_archive():
         handlers += SM_HANDLERS
-    handlers += cores.cores_handlers()
     return handlers
 
 
