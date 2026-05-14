@@ -32,7 +32,7 @@ COPY --chown=1000:0 nuodb-operations /opt/nuodb-operations
 COPY --chown=1000:0 docker/entrypoint.sh /usr/local/bin/
 
 # Install tools requirements
-RUN pip3 install -r /opt/config_watcher/requirements.txt
+RUN pip3 install -r /opt/nuodb-operations/requirements.txt -r /opt/config_watcher/requirements.txt
 
 # Install pynuoadmin
 RUN pip3 install pynuoadmin==${PYNUOADMIN_VERSION}

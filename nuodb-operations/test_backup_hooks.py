@@ -1,7 +1,9 @@
 #!/usr/bin/env python
 
+import hashlib
 import logging
 import os
+from pathlib import Path
 import shutil
 import unittest
 from unittest import mock
@@ -13,12 +15,13 @@ import uuid
 import http
 from http.client import HTTPConnection
 from threading import Thread
-from wsgiref.simple_server import make_server
+from werkzeug.serving import make_server
 import sys
 import shlex
 
 import metrics
 import backup_hooks
+import cores
 from backup_hooks import HooksHandler, LOGGER
 
 LOGGER.setLevel(logging.DEBUG)
@@ -91,6 +94,10 @@ class HttpHandlersTests(unittest.TestCase):
             self.journal_dir = os.path.join(self.test_dir, "journal")
             os.makedirs(self.journal_dir)
             os.environ["NUODB_JOURNAL_DIR"] = self.journal_dir
+        if server_config.get("has_cores", True):
+            self.logs_dir = os.path.join(self.test_dir, "cores")
+            os.makedirs(self.logs_dir)
+            os.environ["NUODB_LOGDIR"] = self.logs_dir
         # Configure custom handlers
         handler_config = None
         custom_handlers = server_config.get("custom_handlers")
@@ -100,6 +107,7 @@ class HttpHandlersTests(unittest.TestCase):
                 f.write(json.dumps(dict(handlers=custom_handlers)))
         # Reload ensures that env changes are picked up and metrics are reset
         importlib.reload(metrics)
+        importlib.reload(cores)
         importlib.reload(backup_hooks)
         # Mock functions
         self.mock_functions()
@@ -172,6 +180,20 @@ class HttpHandlersTests(unittest.TestCase):
             return resp, data
         finally:
             conn.close()
+
+    def path(self, *args):
+        return os.path.join(self.test_dir, *args)
+
+    def assertFileContent(self, name, content):
+        file = self.path(name)
+        self.assertTrue(os.path.isfile(file), f"File {file} does not exist")
+        with open(file, "r") as f:
+            actual = f.read()
+            self.assertEqual(content, actual, f"File {file} content differ")
+
+    def assertFileNotExist(self, name):
+        file = self.path(name)
+        self.assertFalse(os.path.exists(file), f"File {file} still exists")
 
     @ConfigOverrides(
         custom_handlers=[
@@ -267,12 +289,126 @@ class HttpHandlersTests(unittest.TestCase):
             out,
         )
 
+    @mock.patch("backup_hooks.get_builtin_handlers")
+    def testMultiHandlerPath(self, mock_handlers):
+        def no_argument_function():
+            return "no_argument_function was called"
+
+        def single_argument_function(arg1):
+            return f"single_argument_function was called {arg1}"
+
+        def three_argument_function(arg1, arg2, arg3):
+            return f"three_argument_function was called {arg1} {arg2} {arg3}"
+
+        mock_handlers.return_value = [
+            ("GET", "singlepath", [no_argument_function]),
+            ("GET", "multipath", [three_argument_function, single_argument_function]),
+            (
+                "GET",
+                "allpath",
+                [
+                    three_argument_function,
+                    single_argument_function,
+                    no_argument_function,
+                ],
+            ),
+            ("GET", "nonepath", []),
+        ]
+
+        # Test a path with only one handler
+        test_path = "/singlepath/foo"
+        resp, data = self.request(method="GET", path=test_path)
+        self.assertEqual(http.HTTPStatus.BAD_REQUEST, resp.status, str(data))
+        data = json.loads(data)
+        self.assertFalse(data["success"])
+        self.assertEqual(
+            data["message"],
+            f"0 parameter(s) expected but 1 supplied in request {test_path}, including payload and query parameters",
+        )
+
+        resp, data = self.request(method="GET", path="/singlepath")
+        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+        data = json.loads(data)
+        self.assertEqual(data, "no_argument_function was called")
+
+        # Test path with multiple handlers, starting with bad argument counts
+        test_path = "/multipath"
+        resp, data = self.request(method="GET", path=test_path)
+        self.assertEqual(http.HTTPStatus.BAD_REQUEST, resp.status, str(data))
+        data = json.loads(data)
+        self.assertFalse(data["success"])
+        self.assertEqual(
+            data["message"],
+            f"1 or 3 parameter(s) expected but 0 supplied in request {test_path}, including payload and query parameters",
+        )
+
+        test_path = "/multipath/one/two"
+        resp, data = self.request(method="GET", path=test_path)
+        self.assertEqual(http.HTTPStatus.BAD_REQUEST, resp.status, str(data))
+        data = json.loads(data)
+        self.assertFalse(data["success"])
+        self.assertEqual(
+            data["message"],
+            f"1 or 3 parameter(s) expected but 2 supplied in request {test_path}, including payload and query parameters",
+        )
+
+        test_path = "/multipath/one/two/three/four"
+        resp, data = self.request(method="GET", path=test_path)
+        self.assertEqual(http.HTTPStatus.BAD_REQUEST, resp.status, str(data))
+        data = json.loads(data)
+        self.assertFalse(data["success"])
+        self.assertEqual(
+            data["message"],
+            f"1 or 3 parameter(s) expected but 4 supplied in request {test_path}, including payload and query parameters",
+        )
+
+        # And test that the happy case still works
+        resp, data = self.request(method="GET", path="/multipath/one")
+        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+        data = json.loads(data)
+        self.assertEqual(data, "single_argument_function was called one")
+
+        resp, data = self.request(method="GET", path="/multipath/one/two/three")
+        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+        data = json.loads(data)
+        self.assertEqual(data, "three_argument_function was called one two three")
+
+        # Test a path with lots of handlers
+        test_path = "/allpath/one/two"
+        resp, data = self.request(method="GET", path=test_path)
+        self.assertEqual(http.HTTPStatus.BAD_REQUEST, resp.status, str(data))
+        data = json.loads(data)
+        self.assertFalse(data["success"])
+        self.assertEqual(
+            data["message"],
+            f"0, 1, or 3 parameter(s) expected but 2 supplied in request {test_path}, including payload and query parameters",
+        )
+
+        resp, data = self.request(method="GET", path="/allpath")
+        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+        data = json.loads(data)
+        self.assertEqual(data, "no_argument_function was called")
+
+        resp, data = self.request(method="GET", path="/allpath/one")
+        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+        data = json.loads(data)
+        self.assertEqual(data, "single_argument_function was called one")
+
+        resp, data = self.request(method="GET", path="/allpath/one/two/three")
+        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+        data = json.loads(data)
+        self.assertEqual(data, "three_argument_function was called one two three")
+
+        # Test the case of a path with no handler
+        test_path = "/nonepath"
+        resp, data = self.request(method="GET", path=test_path)
+        self.assertEqual(http.HTTPStatus.BAD_REQUEST, resp.status, str(data))
+        data = json.loads(data)
+        self.assertFalse(data["success"])
+        self.assertEqual(data["message"], f"No handler found for path {test_path}")
+
 
 class BackupHooksTest(HttpHandlersTests):
-
-    def path(self, *args):
-        return os.path.join(self.test_dir, *args)
-
     def mock_functions(self):
         server_config = self.get_server_config()
         nuodb_processes = server_config.get(
@@ -302,17 +438,6 @@ class BackupHooksTest(HttpHandlersTests):
             path=f"/post-backup/{backup_id}?force={str(force).lower()}",
         )
         return resp, json.loads(data)
-
-    def assertFileContent(self, name, content):
-        file = self.path(name)
-        self.assertTrue(os.path.isfile(file), f"File {file} does not exist")
-        with open(file, "r") as f:
-            actual = f.read()
-            self.assertEqual(content, actual, f"File {file} content differ")
-
-    def assertFileNotExist(self, name):
-        file = self.path(name)
-        self.assertFalse(os.path.exists(file), f"File {file} still exists")
 
     @mock.patch("backup_hooks.freeze_archive")
     def testPrePostHooks(self, freeze_archive_mock=None):
@@ -480,6 +605,214 @@ class NoArchivesHandlersTest(HttpHandlersTests):
         self.assertNotIn('nuodb_volume_available_bytes{volume="archive-volume"}', out)
 
         self.assertNotIn('nuodb_volume_available_bytes{volume="journal-volume"}', out)
+
+
+class CoresHandlersTest(HttpHandlersTests):
+    def get_cores(self, after=None):
+        query_params = []
+        if after:
+            query_params.append(f"modifiedAfterEpochSec={after}")
+        path = "/cores"
+        if query_params:
+            path = f"{path}?{'&'.join(query_params)}"
+        resp, data = self.request(method="GET", path=path)
+        return resp, json.loads(data)
+
+    def get_core(self, core_path, range_start="", range_end=""):
+        headers = {}
+        if range_start or range_end:
+            headers["Range"] = f"bytes={range_start}-{range_end}"
+        resp, data = self.request(
+            method="GET", path=f"/cores/{core_path}", headers=headers
+        )
+        return resp, data
+
+    def delete_core(self, core_path):
+        resp, data = self.request(method="DELETE", path=f"/cores/{core_path}")
+        return resp, json.loads(data)
+
+    @ConfigOverrides(has_cores=False)
+    def testNoCoresDir(self):
+        "Test that the handler can gracefully handle not having a cores directory."
+
+        self.assertNotIn(
+            "NUODB_LOGDIR",
+            os.environ,
+            "TEST ERROR: NUODB_LOGDIR should not be set",
+        )
+        resp, cores = self.get_cores()
+        self.assertEqual(resp.status, http.HTTPStatus.OK)
+        self.assertEqual(cores, [])
+
+        resp, data = self.get_core("core.nuodb.abc.123")
+        self.assertEqual(resp.status, http.HTTPStatus.NOT_FOUND)
+        data = json.loads(data)
+        self.assertFalse(data["success"])
+        self.assertEqual(data["message"], "File not found")
+
+        resp, data = self.delete_core("core.nuodb.abc.123")
+        self.assertEqual(resp.status, http.HTTPStatus.NOT_FOUND)
+        self.assertFalse(data["success"])
+        self.assertEqual(data["message"], "File not found")
+
+    def testCoresGetAndDelete(self):
+        "Test that we can find, fetch, and delete a core."
+
+        resp, cores = self.get_cores()
+        self.assertEqual(resp.status, http.HTTPStatus.OK)
+        self.assertEqual(cores, [])
+
+        core_name = "core.nuodb.abc.123"
+        file_contents = b"The file contents that we expect to be there."
+        core_file_path = self.path("cores", "crash", core_name)
+        os.makedirs(os.path.dirname(core_file_path))
+        ts_before = int(time.time())
+        with open(core_file_path, "wb") as f:
+            f.write(file_contents)
+        ts_after = time.time()
+
+        resp, cores = self.get_cores()
+        self.assertEqual(resp.status, http.HTTPStatus.OK)
+        self.assertEqual(len(cores), 1)
+        name, timestamp, filehash = cores[0]
+        self.assertEqual(name, core_name)
+        self.assertGreaterEqual(timestamp, ts_before)
+        self.assertLessEqual(timestamp, ts_after)
+        self.assertEqual(filehash, hashlib.sha1(file_contents).hexdigest())
+
+        resp, core = self.get_core(core_name)
+        self.assertEqual(resp.status, http.HTTPStatus.OK)
+        self.assertEqual(int(resp.getheader("Content-Length")), len(file_contents))
+        self.assertEqual(resp.getheader("Accept-Ranges"), "bytes")
+        self.assertIn("attachment", resp.getheader("Content-Disposition"))
+        self.assertEqual(core, file_contents)
+
+        resp, data = self.delete_core(core_name)
+        self.assertEqual(resp.status, http.HTTPStatus.OK)
+        self.assertTrue(data["success"])
+        self.assertFileNotExist(core_file_path)
+
+        resp, cores = self.get_cores()
+        self.assertEqual(resp.status, http.HTTPStatus.OK)
+        self.assertEqual(cores, [])
+
+        resp, data = self.get_core(core_name)
+        self.assertEqual(resp.status, http.HTTPStatus.NOT_FOUND)
+        data = json.loads(data)
+        self.assertFalse(data["success"])
+        self.assertEqual(data["message"], "File not found")
+
+    def testCoreListing(self):
+        "Test listing cores."
+
+        # Test that the are not cores to start off
+        resp, cores = self.get_cores()
+        self.assertEqual(resp.status, http.HTTPStatus.OK)
+        self.assertEqual(cores, [])
+
+        # Create some cores
+        ts_before = int(time.time())
+        os.makedirs(self.path("cores", "crash"))
+        Path(self.path("cores", "crash", "core.nuodb.abc.123")).touch()
+        Path(self.path("cores", "crash", "core.nuodb.abc.456")).touch()
+        time.sleep(1)  # Make sure that the creation time on the last core is different
+        last_core_time = int(time.time())
+        os.makedirs(self.path("cores", "crash-789T123"))
+        Path(self.path("cores", "crash-789T123", "core.nuodb.abc.210")).touch()
+        ts_after = time.time()
+
+        # Add some other files that are not cores and should not show up
+        Path(self.path("cores", "nuosm.log")).touch()  # Not a core
+        Path(
+            self.path("cores", "core.nuodb.abc.123")
+        ).touch()  # Core outside a crash directory
+        Path(
+            self.path("cores", "crash-789T123", "nuosm.log")
+        ).touch()  # Non-core file in a crash directory
+        os.makedirs(self.path("cores", "nuosm.log.1"))
+        Path(
+            self.path("cores", "nuosm.log.1", "core.nuodb.abc.666")
+        ).touch()  # Core not in a valid directory
+
+        expected_cores = [
+            "789T123-core.nuodb.abc.210",
+            "core.nuodb.abc.123",
+            "core.nuodb.abc.456",
+        ]
+        expected_hash = hashlib.sha1(b"").hexdigest()
+        resp, cores = self.get_cores()
+        self.assertEqual(resp.status, http.HTTPStatus.OK, cores)
+        self.assertEqual(len(cores), len(expected_cores))
+        for i, core in enumerate(cores):
+            name, timestamp, filehash = core
+            self.assertEqual(name, expected_cores[i])
+            self.assertGreaterEqual(timestamp, ts_before)
+            self.assertLessEqual(timestamp, ts_after)
+            self.assertEqual(filehash, expected_hash)
+
+        resp, cores = self.get_cores(after=last_core_time)
+        self.assertEqual(resp.status, http.HTTPStatus.OK, cores)
+        self.assertEqual(len(cores), 1)
+        name, timestamp, filehash = cores[0]
+        self.assertEqual(name, "789T123-core.nuodb.abc.210")
+        self.assertGreaterEqual(timestamp, last_core_time)
+        self.assertLessEqual(timestamp, ts_after)
+        self.assertEqual(filehash, expected_hash)
+
+        # Test that get and delete also ignore the non-core files
+        resp, data = self.get_core("nuosm.log")
+        self.assertEqual(resp.status, http.HTTPStatus.BAD_REQUEST)
+        data = json.loads(data)
+        self.assertFalse(data["success"])
+        self.assertEqual(data["message"], "Invalid core")
+
+        resp, data = self.delete_core("core.nuodb.abc.666")
+        self.assertEqual(resp.status, http.HTTPStatus.NOT_FOUND)
+        self.assertFalse(data["success"])
+        self.assertEqual(data["message"], "File not found")
+
+    def testFilePagination(self):
+        "Test fetching a file in chunks."
+
+        file_contents = (
+            b"""
+        Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod
+        tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim
+        veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea
+        commodo consequat. Duis aute irure dolor in reprehenderit in voluptate
+        velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint
+        occaecat cupidatat non proident, sunt in culpa qui officia deserunt
+        mollit anim id est laborum.
+        """
+            * 10
+        )
+        file_name = "core.nuodb.abc.123"
+        core_name = "20260505T130153-" + file_name
+        core_file_path = self.path("cores", "crash-20260505T130153", file_name)
+        os.makedirs(os.path.dirname(core_file_path))
+        ts_before = int(time.time())
+        with open(core_file_path, "wb") as f:
+            f.write(file_contents)
+        ts_after = time.time()
+
+        resp, cores = self.get_cores()
+        self.assertEqual(resp.status, http.HTTPStatus.OK)
+        self.assertEqual(len(cores), 1)
+        name, timestamp, filehash = cores[0]
+        self.assertEqual(name, core_name)
+        self.assertGreaterEqual(timestamp, ts_before)
+        self.assertLessEqual(timestamp, ts_after)
+        self.assertEqual(filehash, hashlib.sha1(file_contents).hexdigest())
+
+        pagesize = 100
+        for page_start in range(0, len(file_contents), pagesize):
+            page_end = page_start + pagesize
+            resp, core = self.get_core(
+                core_name, range_start=page_start, range_end=page_end - 1
+            )
+            self.assertEqual(resp.status, http.HTTPStatus.PARTIAL_CONTENT)
+            self.assertEqual(resp.getheader("Accept-Ranges"), "bytes")
+            self.assertEqual(core, file_contents[page_start:page_end])
 
 
 class CliTests(unittest.TestCase):

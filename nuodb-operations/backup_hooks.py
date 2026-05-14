@@ -9,12 +9,15 @@ import subprocess
 import sys
 import time
 import urllib
-import wsgiref
-from wsgiref import simple_server
-from threading import Timer
+import wsgiref.util
+from threading import Lock, Timer
 from shutil import which, disk_usage
 
+import werkzeug
+
 from metrics import Gauge, Histogram, REGISTRY
+from handler_common import HttpError, UserError
+import cores
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 LOGGER = logging.getLogger(__name__)
@@ -40,6 +43,9 @@ JOURNAL_BACKUP_ID_FILE = from_dir(JOURNAL_DIR, "backup.txt")
 BACKUP_PAYLOAD_FILE = from_dir(ARCHIVE_DIR, "backup_payload.txt")
 BACKUP_START_ID_FILE = from_dir(ARCHIVE_DIR, "backup_sid.txt")
 RESTORED_FILE = from_dir(ARCHIVE_DIR, "restored.txt")
+
+# The pre- and post-backup hooks are not thread safe, so create a mutex for them
+backup_hooks_lock = Lock()
 
 VOLUME_AVAILABLE_BYTES = Gauge(
     "nuodb_volume_available_bytes",
@@ -234,72 +240,73 @@ def pre_backup(backup_id, payload):
     if not backup_id:
         raise UserError("Backup ID not specified")
 
-    # Get nuodb processes
-    processes = get_nuodb_process_info()
-    if not processes:
-        raise RuntimeError("No nuodb process found")
+    with backup_hooks_lock:
+        # Get nuodb processes
+        processes = get_nuodb_process_info()
+        if not processes:
+            raise RuntimeError("No nuodb process found")
 
-    # Make sure we do not attempt to execute pre-backup hook if a backup is
-    # already in progress, which may block indefinitely if writes to the
-    # archive and journal directories are frozen
-    if os.path.exists(ARCHIVE_BACKUP_ID_FILE):
-        # Check if the SM process was restarted which will invalidate the
-        # previous pre-backup operation using HotSnap.
-        stored_start_id = get_start_id()
-        if (
-            FREEZE_MODE != MODE_FSFREEZE
-            and stored_start_id
-            and processes[0]["sid"] != stored_start_id
-        ):
-            # Remote the backup files from the previous pre-backup operation
-            LOGGER.warning(
-                "Unexpected start ID: current=%s, stored=%s. "
-                + "SM process restarted while executing backup ID %s.",
-                processes[0]["sid"],
-                stored_start_id,
-                get_backup_id(),
-            )
-            remove_backup_files()
-        else:
-            raise UserError(
-                f"Backup ID file {ARCHIVE_BACKUP_ID_FILE} exists. "
-                + "Execute post-backup hook to complete current backup."
-            )
-    # Get timeout for the operation if specified
-    timeout = get_backup_timeout(payload)
+        # Make sure we do not attempt to execute pre-backup hook if a backup is
+        # already in progress, which may block indefinitely if writes to the
+        # archive and journal directories are frozen
+        if os.path.exists(ARCHIVE_BACKUP_ID_FILE):
+            # Check if the SM process was restarted which will invalidate the
+            # previous pre-backup operation using HotSnap.
+            stored_start_id = get_start_id()
+            if (
+                FREEZE_MODE != MODE_FSFREEZE
+                and stored_start_id
+                and processes[0]["sid"] != stored_start_id
+            ):
+                # Remote the backup files from the previous pre-backup operation
+                LOGGER.warning(
+                    "Unexpected start ID: current=%s, stored=%s. "
+                    + "SM process restarted while executing backup ID %s.",
+                    processes[0]["sid"],
+                    stored_start_id,
+                    get_backup_id(),
+                )
+                remove_backup_files()
+            else:
+                raise UserError(
+                    f"Backup ID file {ARCHIVE_BACKUP_ID_FILE} exists. "
+                    + "Execute post-backup hook to complete current backup."
+                )
+        # Get timeout for the operation if specified
+        timeout = get_backup_timeout(payload)
 
-    # Delete file that is used by restored database to signal that archive
-    # preparation is complete. This may be present if this database was
-    # restored from a backup and this is the first time that a backup has been
-    # taken on it.
-    if os.path.exists(RESTORED_FILE):
-        os.remove(RESTORED_FILE)
+        # Delete file that is used by restored database to signal that archive
+        # preparation is complete. This may be present if this database was
+        # restored from a backup and this is the first time that a backup has been
+        # taken on it.
+        if os.path.exists(RESTORED_FILE):
+            os.remove(RESTORED_FILE)
 
-    # Write the start_id of the SM to a file
-    write_file(BACKUP_START_ID_FILE, processes[0]["sid"])
+        # Write the start_id of the SM to a file
+        write_file(BACKUP_START_ID_FILE, processes[0]["sid"])
 
-    # Write backup ID to archive directory
-    write_file(ARCHIVE_BACKUP_ID_FILE, backup_id)
+        # Write backup ID to archive directory
+        write_file(ARCHIVE_BACKUP_ID_FILE, backup_id)
 
-    # Write backup ID to journal directory if it is separate from archive
-    if JOURNAL_DIR is not None:
-        write_file(JOURNAL_BACKUP_ID_FILE, backup_id)
+        # Write backup ID to journal directory if it is separate from archive
+        if JOURNAL_DIR is not None:
+            write_file(JOURNAL_BACKUP_ID_FILE, backup_id)
 
-    # Write opaque data in request payload that should be backed up
-    # (snapshotted) with archive
-    if payload is not None and payload.get("opaque"):
-        write_file(BACKUP_PAYLOAD_FILE, payload["opaque"])
-    elif os.path.exists(BACKUP_PAYLOAD_FILE):
-        # Remove opaque data from last backup
-        os.remove(BACKUP_PAYLOAD_FILE)
+        # Write opaque data in request payload that should be backed up
+        # (snapshotted) with archive
+        if payload is not None and payload.get("opaque"):
+            write_file(BACKUP_PAYLOAD_FILE, payload["opaque"])
+        elif os.path.exists(BACKUP_PAYLOAD_FILE):
+            # Remove opaque data from last backup
+            os.remove(BACKUP_PAYLOAD_FILE)
 
-    # If the archive and journal are on separate volumes, block writes to the
-    # archive to allow consistent snapshots to be obtained of both
-    if JOURNAL_DIR is not None:
-        freeze_archive(backup_id, processes, timeout=timeout)
+        # If the archive and journal are on separate volumes, block writes to the
+        # archive to allow consistent snapshots to be obtained of both
+        if JOURNAL_DIR is not None:
+            freeze_archive(backup_id, processes, timeout=timeout)
 
-    # Cancel backup operation after specified timeout
-    schedule_cancellation(backup_id, timeout)
+        # Cancel backup operation after specified timeout
+        schedule_cancellation(backup_id, timeout)
 
 
 def schedule_cancellation(backup_id, timeout):
@@ -329,43 +336,44 @@ def post_backup(backup_id, query):
 
     # Check backup ID to make sure it matches current backup
     force = query is not None and query.get("force") in [True, "true"]
-    current_backup_id = get_backup_id()
-    if current_backup_id != backup_id:
-        msg = "Unexpected backup ID: current={}, supplied={}".format(
-            current_backup_id, backup_id
-        )
-        # If force=true, then do not fail on mismatching backup ID
-        if force:
-            LOGGER.warning(msg)
-        else:
-            raise UserError(msg)
+    with backup_hooks_lock:
+        current_backup_id = get_backup_id()
+        if current_backup_id != backup_id:
+            msg = "Unexpected backup ID: current={}, supplied={}".format(
+                current_backup_id, backup_id
+            )
+            # If force=true, then do not fail on mismatching backup ID
+            if force:
+                LOGGER.warning(msg)
+            else:
+                raise UserError(msg)
 
-    # Get backup file creation timestamp
-    ctime = get_backup_ctime()
-    # Get nuodb processes
-    processes = get_nuodb_process_info()
-    if not processes:
-        raise RuntimeError("No nuodb process found")
+        # Get backup file creation timestamp
+        ctime = get_backup_ctime()
+        # Get nuodb processes
+        processes = get_nuodb_process_info()
+        if not processes:
+            raise RuntimeError("No nuodb process found")
 
-    # If the archive and journal are on separate volumes, we must unblock
-    # writes to the archive
-    if JOURNAL_DIR is not None:
-        try:
-            freeze_archive(backup_id, processes, unfreeze=True)
-        except ArchivingNotPausedError:
-            # Delete backup metadata files to allow new backups
-            remove_backup_files()
-            # Record the snapshot duration even if the database archiving was
-            # already resumed due to internal engine timeout
-            if ctime:
-                BACKUP_DURATION_SECONDS.observe(time.time() - ctime)
-            raise
+        # If the archive and journal are on separate volumes, we must unblock
+        # writes to the archive
+        if JOURNAL_DIR is not None:
+            try:
+                freeze_archive(backup_id, processes, unfreeze=True)
+            except ArchivingNotPausedError:
+                # Delete backup metadata files to allow new backups
+                remove_backup_files()
+                # Record the snapshot duration even if the database archiving was
+                # already resumed due to internal engine timeout
+                if ctime:
+                    BACKUP_DURATION_SECONDS.observe(time.time() - ctime)
+                raise
 
-    # Delete backup metadata files
-    remove_backup_files()
-    # Record the total duration of the snapshot operation
-    if ctime:
-        BACKUP_DURATION_SECONDS.observe(time.time() - ctime)
+        # Delete backup metadata files
+        remove_backup_files()
+        # Record the total duration of the snapshot operation
+        if ctime:
+            BACKUP_DURATION_SECONDS.observe(time.time() - ctime)
 
 
 def remove_backup_files():
@@ -414,18 +422,6 @@ class ArchivingNotPausedError(subprocess.CalledProcessError):
         return self.output.decode("utf-8").strip()
 
 
-class HttpError(RuntimeError):
-    def __init__(self, status, message):
-        super().__init__(message)
-        self.status = status
-        self.message = message
-
-
-class UserError(HttpError):
-    def __init__(self, message):
-        super().__init__(http.HTTPStatus.BAD_REQUEST, message)
-
-
 def log_error(exc):
     if isinstance(exc, subprocess.CalledProcessError):
         stdout = exc.stdout.decode("utf-8")
@@ -447,13 +443,13 @@ def create_error(exc):
 
 
 SM_HANDLERS = [
-    ("POST", "pre-backup", pre_backup),
-    ("POST", "post-backup", post_backup),
+    ("POST", "pre-backup", [pre_backup]),
+    ("POST", "post-backup", [post_backup]),
 ]
 
 COMMON_HANDLERS = [
-    ("GET", "metrics", lambda: REGISTRY.collect()),  # pylint: disable=W0108
-]
+    ("GET", "metrics", [lambda: REGISTRY.collect()]),  # pylint: disable=W0108
+] + cores.cores_handlers()
 
 
 def get_payload(environ):
@@ -610,44 +606,65 @@ class RequestInfo(object):  # pylint: disable=too-few-public-methods
 
 def handle_method(req):
     # Find a handler that matches the request
-    for method, path_prefix, handler in get_builtin_handlers():
+    for method, path_prefix, handlers in get_builtin_handlers():
         if req.method == method and req.components[0] == path_prefix:
             # Make sure the correct number of parameters were supplied by
             # inspecting method signature
-            args = req.components[1:]
-            pos_args = inspect.getfullargspec(handler).args
-            # If `payload` is in the method signature, then read the request
-            # payload as JSON and pass it at the corresponding index
-            if "payload" in pos_args:
-                try:
-                    decoded_payload = json.loads(req.payload) if req.payload else None
-                    args.insert(pos_args.index("payload"), decoded_payload)
-                except json.JSONDecodeError as e:
-                    raise UserError(  # pylint: disable=raise-missing-from
-                        "Unable to decode request payload: " + str(e)
-                    )
-            # If `query` is in the method signature, then parse the query
-            # parameters as a dictionary and pass them at the corresponding
-            # index
-            if "query" in pos_args:
-                args.insert(pos_args.index("query"), req.query_params)
-            if len(args) != len(pos_args):
-                msg = "{} parameter(s) expected but {} supplied in request {}".format(
-                    len(pos_args), len(args), req.parsed.path
+            arg_count = set()
+            for handler in handlers:
+                # Make a fresh copy of the request components on each iteration since we modify it
+                args = req.components[1:]
+                pos_args = inspect.getfullargspec(handler).args
+                # If `payload` is in the method signature, then read the request
+                # payload as JSON and pass it at the corresponding index
+                if "payload" in pos_args:
+                    try:
+                        decoded_payload = (
+                            json.loads(req.payload) if req.payload else None
+                        )
+                        args.insert(pos_args.index("payload"), decoded_payload)
+                    except json.JSONDecodeError as e:
+                        raise UserError(  # pylint: disable=raise-missing-from
+                            "Unable to decode request payload: " + str(e)
+                        )
+                # If `query` is in the method signature, then parse the query
+                # parameters as a dictionary and pass them at the corresponding
+                # index
+                if "query" in pos_args:
+                    args.insert(pos_args.index("query"), req.query_params)
+                if len(args) == len(pos_args):
+                    # Request is valid. Send it to handler.
+                    return path_prefix, handler(*args)
+                arg_count.add(len(pos_args))
+            sorted_counts = sorted(arg_count)
+            if len(sorted_counts) == 0:
+                LOGGER.error("No handlers found for path %s", path_prefix)
+                continue
+            if len(sorted_counts) == 1:
+                human_readable_args = str(sorted_counts[0])
+            elif len(sorted_counts) == 2:
+                human_readable_args = f"{sorted_counts[0]} or {sorted_counts[1]}"
+            else:
+                human_readable_args = ", ".join(map(str, sorted_counts[:-1]))
+                human_readable_args = f"{human_readable_args}, or {sorted_counts[-1]}"
+            msg = (
+                "{} parameter(s) expected but "
+                "{} supplied in request {}, including payload and query parameters".format(
+                    human_readable_args, len(args), req.parsed.path
                 )
-                if "payload" in pos_args or "query" in pos_args:
-                    msg += ", including payload and query parameters"
-                raise UserError(msg)
-            # Request is valid. Send it to handler.
-            return path_prefix, handler(*args)
+            )
+            raise UserError(msg)
 
     # Handler was not found
     raise UserError("No handler found for path " + req.parsed.path)
 
 
-def create_response(start_response, status, data=None):
+def create_response(environ, start_response, status, data=None):
     status_str = "{0.value} {0.phrase}".format(status)
     headers = []
+    if isinstance(data, os.PathLike):
+        resp = werkzeug.utils.send_file(data, environ, as_attachment=True)
+        return resp(environ, start_response)
     if isinstance(data, bytes):
         # If data can be decoded as JSON, use application/json
         try:
@@ -685,14 +702,15 @@ class HooksHandler(object):
                 "No archive dir found, not configuring certain built-in handlers."
             )
 
-        for method, path_prefix, handler in get_builtin_handlers():
+        for method, path_prefix, handlers in get_builtin_handlers():
             path = path_prefix
-            for arg in inspect.getfullargspec(handler).args:
-                if arg not in ["payload", "query"]:
-                    path += "/{" + arg + "}"
-            builtin_handlers.append(
-                "{}{} /{}".format(indent * " ", method, normalize_path(path))
-            )
+            for handler in handlers:
+                for arg in inspect.getfullargspec(handler).args:
+                    if arg not in ["payload", "query"]:
+                        path += "/{" + arg + "}"
+                builtin_handlers.append(
+                    "{}{} /{}".format(indent * " ", method, normalize_path(path))
+                )
         if builtin_handlers:
             LOGGER.info("Built-in handlers:\n%s", "\n".join(builtin_handlers))
         else:
@@ -741,12 +759,12 @@ class HooksHandler(object):
 
     def __call__(self, environ, start_response):
         status, json_response = self.handle(environ)
-        return create_response(start_response, status, json_response)
+        return create_response(environ, start_response, status, json_response)
 
 
 def start_server(port, handler_config):
     hooks_handler = HooksHandler(handler_config)
-    with simple_server.make_server("", port, hooks_handler) as httpd:
+    with werkzeug.serving.make_server("", port, hooks_handler, threaded=True) as httpd:
         LOGGER.info("Starting backup hooks server on port %s", port)
         httpd.serve_forever()
 
