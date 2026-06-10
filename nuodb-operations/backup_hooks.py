@@ -10,7 +10,7 @@ import sys
 import time
 import urllib
 import wsgiref.util
-from threading import Lock, Timer
+from threading import Lock, Timer, Thread
 from shutil import which, disk_usage
 
 import werkzeug
@@ -26,6 +26,12 @@ ARCHIVE_DIR = os.environ.get("NUODB_ARCHIVE_DIR", "/mnt/archive")
 JOURNAL_DIR = os.environ.get("NUODB_JOURNAL_DIR")
 FREEZE_MODE = os.environ.get("FREEZE_MODE")
 FREEZE_TIMEOUT = os.environ.get("FREEZE_TIMEOUT")
+
+MAX_JOURNAL_PERCENT_THRESHOLD = float(
+    os.environ.get("MAX_JOURNAL_PERCENT_THRESHOLD", 80)
+)
+MAX_JOURNAL_DURATION = int(os.environ.get("MAX_JOURNAL_DURATION", 30))
+MAX_JOURNAL_INTERVAL = int(os.environ.get("MAX_JOURNAL_INTERVAL", 5))
 
 MODE_HOTSNAP = "hotsnap"
 MODE_FSFREEZE = "fsfreeze"
@@ -305,28 +311,68 @@ def pre_backup(backup_id, payload):
         if JOURNAL_DIR is not None:
             freeze_archive(backup_id, processes, timeout=timeout)
 
-        # Cancel backup operation after specified timeout
+        # Cancel backup operation prematurely
         schedule_cancellation(backup_id, timeout)
 
 
-def schedule_cancellation(backup_id, timeout):
+def cancel_backup(backup_id, reason):
+    try:
+        current_backup_id = get_backup_id()
+        if current_backup_id and current_backup_id == backup_id:
+            LOGGER.warning(
+                "Canceling backup with ID %s. %s",
+                backup_id,
+                reason,
+            )
+            post_backup(backup_id, query={})
+    except ArchivingNotPausedError:
+        # Suppress this error during backup cancellation
+        pass
+
+
+def journal_utilization():
+    if JOURNAL_DIR is not None:
+        total, used, _ = disk_usage(JOURNAL_DIR)
+        return (used / total) * 100
+
+
+def monitor_journal_size(backup_id, threshold, interval=5, duration=30):
+    alert_time = None
+    while get_backup_id() == backup_id:
+        now = time.monotonic()
+        util = journal_utilization()
+        LOGGER.debug("Journal volume utilization %.2f", util)
+        # check if utilization is above threshold
+        if util > threshold:
+            if alert_time is None:
+                alert_time = now
+            elif now - alert_time >= duration:
+                # elapsed time more than the specified duration so cancel the
+                # backup operation
+                cancel_backup(
+                    backup_id,
+                    f"Journal volume utilization {util:.2f}% above threshold ({threshold}%)",
+                )
+        else:
+            # reset the time once utilization drops below threshold
+            alert_time = None
+        time.sleep(interval)
+
+
+def schedule_cancellation(backup_id, timeout=None):
     if timeout and timeout > 0:
-
-        def cancel_backup():
-            try:
-                current_backup_id = get_backup_id()
-                if current_backup_id and current_backup_id == backup_id:
-                    LOGGER.warning(
-                        "Canceling backup with ID %s. Timeout after %ds.",
-                        backup_id,
-                        timeout,
-                    )
-                    post_backup(backup_id, query={})
-            except ArchivingNotPausedError:
-                # Suppress this error during backup cancellation
-                pass
-
-        Timer(timeout, cancel_backup).start()
+        # schedule cancelation based on timeout
+        Timer(
+            timeout, lambda: cancel_backup(backup_id, f"Timeout after {timeout}s.")
+        ).start()
+    if JOURNAL_DIR is not None:
+        # schedule cancelation based on journal size
+        Thread(
+            target=monitor_journal_size,
+            args=(backup_id, MAX_JOURNAL_PERCENT_THRESHOLD),
+            kwargs={"interval": MAX_JOURNAL_INTERVAL, "duration": MAX_JOURNAL_DURATION},
+            daemon=True,
+        ).start()
 
 
 def post_backup(backup_id, query):

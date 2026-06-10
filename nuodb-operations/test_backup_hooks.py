@@ -98,6 +98,9 @@ class HttpHandlersTests(unittest.TestCase):
             self.logs_dir = os.path.join(self.test_dir, "cores")
             os.makedirs(self.logs_dir)
             os.environ["NUODB_LOGDIR"] = self.logs_dir
+        for k, v in server_config.items():
+            if k.startswith("env_"):
+                os.environ[k[4:]] = v
         # Configure custom handlers
         handler_config = None
         custom_handlers = server_config.get("custom_handlers")
@@ -566,6 +569,57 @@ class BackupHooksExternalJournalTest(BackupHooksTest):
     def tearDown(self):
         super().tearDown()
         self.freeze_archive_patch.stop()
+
+    @ConfigOverrides(env_MAX_JOURNAL_DURATION="5", env_MAX_JOURNAL_INTERVAL="1")
+    @mock.patch("backup_hooks.journal_utilization")
+    def testBackupCancelationOnJournalUtilization(self, journal_usage_mock=None):
+        # set journal utilization below threshold (80%)
+        journal_usage_mock.return_value = 50
+
+        # invoke pre-backup hook
+        backup_id = str(uuid.uuid4())
+        resp, data = self.pre_backup(backup_id)
+        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+        self.assertTrue(data["success"], "pre-backup hook reported failure")
+
+        # verify that backup.txt file is created
+        self.assertFileContent(os.path.join(self.archive_dir, "backup.txt"), backup_id)
+
+        # verify that archive has been freezed
+        self.freeze_archive_mock.assert_called_once_with(
+            backup_id, self.nuodb_processes_mock.return_value, timeout=None
+        )
+        self.freeze_archive_mock.reset_mock()
+
+        def assert_archiving_resumed():
+            self.freeze_archive_mock.assert_called_once_with(
+                backup_id, self.nuodb_processes_mock.return_value, unfreeze=True
+            )
+            self.assertFileNotExist(os.path.join(self.archive_dir, "backup.txt"))
+
+        # increase journal utilization to 95%
+        journal_usage_mock.return_value = 95
+
+        # wait two seconds and verify that the archiving is still paused and
+        # backup.txt file is not deleted
+        time.sleep(2)
+        self.freeze_archive_mock.assert_not_called()
+        self.assertFileContent(os.path.join(self.archive_dir, "backup.txt"), backup_id)
+
+        # decrease journal utilization to 70%
+        journal_usage_mock.return_value = 70
+
+        # wait another two seconds and verify that the archiving is still paused
+        # and backup.txt file is not deleted
+        time.sleep(2)
+        self.freeze_archive_mock.assert_not_called()
+        self.assertFileContent(os.path.join(self.archive_dir, "backup.txt"), backup_id)
+
+        # increase journal utilization again above threshold
+        journal_usage_mock.return_value = 85
+
+        # wait for backup operation to be canceled
+        retry(lambda: assert_archiving_resumed, 10)
 
 
 class NoArchivesHandlersTest(HttpHandlersTests):

@@ -85,7 +85,7 @@ docker-build: ## Build NuoDB sidecar docker image.
 
 $(VENV): nuodb-operations/test-requirements.txt config_watcher/test-requirements.txt config_watcher/requirements.txt
 	python3 -m venv $(VENV_DIR)
-	pip3 install \
+	$(VENV_DIR)/bin/python3 -m pip install \
 		-r nuodb-operations/requirements.txt \
 		-r nuodb-operations/test-requirements.txt \
 		-r config_watcher/test-requirements.txt \
