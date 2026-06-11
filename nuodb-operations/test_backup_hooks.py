@@ -98,9 +98,7 @@ class HttpHandlersTests(unittest.TestCase):
             self.logs_dir = os.path.join(self.test_dir, "cores")
             os.makedirs(self.logs_dir)
             os.environ["NUODB_LOGDIR"] = self.logs_dir
-        for k, v in server_config.items():
-            if k.startswith("env_"):
-                os.environ[k[4:]] = v
+        os.environ.update(server_config.get("env", {}))
         # Configure custom handlers
         handler_config = None
         custom_handlers = server_config.get("custom_handlers")
@@ -157,6 +155,14 @@ class HttpHandlersTests(unittest.TestCase):
 
     def start_server(self, handler_config=None):
         handler_config = self.configure_server()
+        # configure cancelation policy
+        cancel_rules = self.get_server_config().get("cancel_rules")
+        if cancel_rules:
+            policy_config = os.path.join(self.test_dir, "cancel-policy.json")
+            with open(policy_config, "w") as f:
+                f.write(json.dumps(dict(rules=cancel_rules)))
+            backup_hooks.CancelationPolicy.load(policy_config)
+        # start HTTP server
         self.host = "127.0.0.1"
         self.port = self.get_local_port()
         LOGGER.info("Starting hooks server on %s:%d", self.host, self.port)
@@ -570,56 +576,226 @@ class BackupHooksExternalJournalTest(BackupHooksTest):
         super().tearDown()
         self.freeze_archive_patch.stop()
 
-    @ConfigOverrides(env_MAX_JOURNAL_DURATION="5", env_MAX_JOURNAL_INTERVAL="1")
-    @mock.patch("backup_hooks.journal_utilization")
-    def testBackupCancelationOnJournalUtilization(self, journal_usage_mock=None):
-        # set journal utilization below threshold (80%)
-        journal_usage_mock.return_value = 50
+    def _testBackupCancelation(self, set_good, set_bad, log_msg):
+        with self.assertLogs(logger=LOGGER, level="DEBUG") as logs:
+            # set value that does not satisfy the rule
+            set_good()
 
-        # invoke pre-backup hook
-        backup_id = str(uuid.uuid4())
-        resp, data = self.pre_backup(backup_id)
-        self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
-        self.assertTrue(data["success"], "pre-backup hook reported failure")
+            # invoke pre-backup hook
+            backup_id = str(uuid.uuid4())
+            resp, data = self.pre_backup(backup_id)
+            self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+            self.assertTrue(data["success"], "pre-backup hook reported failure")
 
-        # verify that backup.txt file is created
-        self.assertFileContent(os.path.join(self.archive_dir, "backup.txt"), backup_id)
+            # verify that backup.txt file is created
+            self.assertFileContent(
+                os.path.join(self.archive_dir, "backup.txt"), backup_id
+            )
 
-        # verify that archive has been freezed
-        self.freeze_archive_mock.assert_called_once_with(
-            backup_id, self.nuodb_processes_mock.return_value, timeout=None
+            # verify that archive has been freezed
+            self.freeze_archive_mock.assert_called_once_with(
+                backup_id, self.nuodb_processes_mock.return_value, timeout=None
+            )
+            self.freeze_archive_mock.reset_mock()
+
+            def assert_archiving_resumed():
+                # verify that archiving has been resumed
+                self.freeze_archive_mock.assert_called_once_with(
+                    backup_id, self.nuodb_processes_mock.return_value, unfreeze=True
+                )
+
+                # verify that backup.txt is removed
+                self.assertFileNotExist(os.path.join(self.archive_dir, "backup.txt"))
+
+                # verify cancelation log message
+                assert any(
+                    f"Canceling backup with ID {backup_id}: {log_msg}" in record.message
+                    for record in logs.records
+                ), logs.output
+
+                # verify monitoring thread has exited
+                assert any(
+                    f"Stopped monitoring backup {backup_id}" in record.message
+                    for record in logs.records
+                ), logs.output
+
+            # set value that satisfies the rules
+            set_bad()
+
+            # wait two seconds and verify that the archiving is still paused and
+            # backup.txt file is not deleted
+            time.sleep(2)
+            self.freeze_archive_mock.assert_not_called()
+            self.assertFileContent(
+                os.path.join(self.archive_dir, "backup.txt"), backup_id
+            )
+
+            # set value that does not satisfy the rule
+            set_good()
+
+            # wait another two seconds and verify that the archiving is still paused
+            # and backup.txt file is not deleted
+            time.sleep(2)
+            self.freeze_archive_mock.assert_not_called()
+            self.assertFileContent(
+                os.path.join(self.archive_dir, "backup.txt"), backup_id
+            )
+
+            # set value that satisfies the rule again
+            set_bad()
+
+            # wait for backup operation to be canceled
+            retry(assert_archiving_resumed, 10)
+
+    @ConfigOverrides(
+        env={"CANCELATION_POLICY_INTERVAL": "1"},
+        cancel_rules=[
+            {
+                "type": "journalUtilization",
+                "op": ">",
+                "threshold": 80,
+                "duration": 5,
+            }
+        ],
+    )
+    @mock.patch("backup_hooks.JournalUtilizationRule.apply")
+    def testBackupCancelationOnJournalUtilization(self, journal_util_mock=None):
+        def set_good():
+            journal_util_mock.return_value = 50
+
+        def set_bad():
+            journal_util_mock.return_value = 85
+
+        self._testBackupCancelation(
+            set_good,
+            set_bad,
+            "Journal volume utilization percentage value 85.00 is greater than 80 for more than 5s",
         )
-        self.freeze_archive_mock.reset_mock()
 
-        def assert_archiving_resumed():
+    @ConfigOverrides(
+        env={"CANCELATION_POLICY_INTERVAL": "1"},
+        cancel_rules=[
+            {
+                "type": "script",
+                "name": "Memory throttling",
+                "script": "cat /tmp/memory_throttling",
+                "op": ">",
+                "threshold": 0,
+                "duration": 5,
+            }
+        ],
+    )
+    @mock.patch("backup_hooks.JournalUtilizationRule.apply")
+    def testBackupCancelationOnScriptRule(self, journal_util_mock=None):
+        journal_util_mock.return_value = 50
+        memory_throttling = Path("/tmp/memory_throttling")
+
+        def set_good():
+            memory_throttling.write_text("0")
+
+        def set_bad():
+            memory_throttling.write_text("32")
+
+        self._testBackupCancelation(
+            set_good,
+            set_bad,
+            "Memory throttling value 32.00 is greater than 0 for more than 5s",
+        )
+
+    @ConfigOverrides(
+        env={"CANCELATION_POLICY_INTERVAL": "1"},
+        cancel_rules=[
+            {
+                "type": "journalUtilization",
+                "op": ">",
+                "threshold": 80,
+                "duration": 5,
+            },
+            {
+                "type": "script",
+                "name": "Memory throttling",
+                "script": "cat /tmp/memory_throttling",
+                "op": ">",
+                "threshold": 0,
+                "duration": 5,
+            },
+        ],
+    )
+    @mock.patch("backup_hooks.JournalUtilizationRule.apply")
+    def testBackupCancelationOnMultipleRules(self, journal_util_mock=None):
+        memory_throttling = Path("/tmp/memory_throttling")
+
+        def set_good():
+            journal_util_mock.return_value = 50
+            memory_throttling.write_text("0")
+
+        def set_bad():
+            journal_util_mock.return_value = 95
+            memory_throttling.write_text("32")
+
+        self._testBackupCancelation(
+            set_good,
+            set_bad,
+            "Journal volume utilization percentage value 95.00 is greater than 80 for more than 5s; "
+            + "Memory throttling value 32.00 is greater than 0 for more than 5s",
+        )
+
+    @ConfigOverrides(
+        env={"CANCELATION_POLICY_INTERVAL": "1"},
+    )
+    @mock.patch("backup_hooks.JournalUtilizationRule.apply")
+    def testBackupNotCanceled(self, journal_util_mock=None):
+        journal_util_mock.return_value = 50
+
+        with self.assertLogs(logger=LOGGER, level="DEBUG") as logs:
+            # invoke pre-backup hook
+            backup_id = str(uuid.uuid4())
+            resp, data = self.pre_backup(backup_id)
+            self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+            self.assertTrue(data["success"], "pre-backup hook reported failure")
+
+            # verify that archive has been freezed
+            self.freeze_archive_mock.assert_called_once_with(
+                backup_id, self.nuodb_processes_mock.return_value, timeout=None
+            )
+            self.freeze_archive_mock.reset_mock()
+
+            # set utilization above threshold
+            journal_util_mock.return_value = 95
+
+            # wait two seconds and verify that the archiving is still paused and
+            # backup.txt file is not deleted
+            time.sleep(2)
+            self.freeze_archive_mock.assert_not_called()
+            self.assertFileContent(
+                os.path.join(self.archive_dir, "backup.txt"), backup_id
+            )
+            self.freeze_archive_mock.reset_mock()
+
+            # invoke post-backup hook
+            resp, data = self.post_backup(backup_id)
+            self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+            self.assertTrue(data["success"], "post-backup hook reported failure")
+
+            # verify that archive has been unfreezed
             self.freeze_archive_mock.assert_called_once_with(
                 backup_id, self.nuodb_processes_mock.return_value, unfreeze=True
             )
-            self.assertFileNotExist(os.path.join(self.archive_dir, "backup.txt"))
 
-        # increase journal utilization to 95%
-        journal_usage_mock.return_value = 95
+            def assert_logs():
+                # verify that backup operation hasn't been canceled
+                assert not any(
+                    f"Canceling backup with ID {backup_id}" in record.message
+                    for record in logs.records
+                ), logs.output
 
-        # wait two seconds and verify that the archiving is still paused and
-        # backup.txt file is not deleted
-        time.sleep(2)
-        self.freeze_archive_mock.assert_not_called()
-        self.assertFileContent(os.path.join(self.archive_dir, "backup.txt"), backup_id)
+                # verify monitoring thread has exited
+                assert any(
+                    f"Stopped monitoring backup {backup_id}" in record.message
+                    for record in logs.records
+                ), logs.output
 
-        # decrease journal utilization to 70%
-        journal_usage_mock.return_value = 70
-
-        # wait another two seconds and verify that the archiving is still paused
-        # and backup.txt file is not deleted
-        time.sleep(2)
-        self.freeze_archive_mock.assert_not_called()
-        self.assertFileContent(os.path.join(self.archive_dir, "backup.txt"), backup_id)
-
-        # increase journal utilization again above threshold
-        journal_usage_mock.return_value = 85
-
-        # wait for backup operation to be canceled
-        retry(lambda: assert_archiving_resumed, 10)
+            retry(assert_logs, 10)
 
 
 class NoArchivesHandlersTest(HttpHandlersTests):
