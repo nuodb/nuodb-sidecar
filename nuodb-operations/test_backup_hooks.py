@@ -791,7 +791,8 @@ class BackupHooksExternalJournalTest(BackupHooksTest):
 
                 # verify monitoring thread has exited
                 assert any(
-                    f"Stopped monitoring backup {backup_id}" in record.message
+                    f"Stopped cancelation policy for backup {backup_id}"
+                    in record.message
                     for record in logs.records
                 ), logs.output
 

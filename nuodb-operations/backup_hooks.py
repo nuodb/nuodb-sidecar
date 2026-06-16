@@ -10,7 +10,7 @@ import sys
 import time
 import urllib
 import wsgiref.util
-from threading import Lock, Timer, Thread
+from threading import Lock, Timer, Thread, Event
 from shutil import which, disk_usage
 import operator
 import copy
@@ -309,28 +309,14 @@ def pre_backup(backup_id, payload):
         if JOURNAL_DIR is not None:
             freeze_archive(backup_id, processes, timeout=timeout)
 
-        # Cancel backup operation prematurely
-        schedule_cancellation(backup_id, timeout)
-
-
-def cancel_backup(backup_id, reason):
-    try:
-        current_backup_id = get_backup_id()
-        if current_backup_id and current_backup_id == backup_id:
-            LOGGER.warning(
-                "Canceling backup with ID %s: %s",
-                backup_id,
-                reason,
-            )
-            post_backup(backup_id, query={})
-    except ArchivingNotPausedError:
-        # Suppress this error during backup cancellation
-        pass
+        # Schedule cancelation for the backup operation
+        CancelationPolicy.apply(backup_id, timeout=timeout)
 
 
 class CancelationPolicy:
     _lock = Lock()
     _rules = None
+    _threads = []
 
     @classmethod
     def load(cls, policy_config):
@@ -349,11 +335,12 @@ class CancelationPolicy:
             return []
 
     @classmethod
-    def apply(cls, backup_id, interval=CANCELATION_POLICY_INTERVAL):
+    def apply(cls, backup_id, interval=CANCELATION_POLICY_INTERVAL, timeout=None):
         rules = cls.rules()
+        stop_event = Event()
 
-        def monitor():
-            while get_backup_id() == backup_id:
+        def monitor_rules():
+            while get_backup_id() == backup_id and not stop_event.is_set():
                 errors = []
                 for rule in rules:
                     err_msg = rule.evaluate()
@@ -361,13 +348,53 @@ class CancelationPolicy:
                         errors.append(err_msg)
                 if len(errors) > 0:
                     # some of the rules are satisfied so cancel the backup operation
-                    cancel_backup(backup_id, "; ".join(errors))
+                    cls.cancel_backup(backup_id, "; ".join(errors))
                     break
-                time.sleep(interval)
+                stop_event.wait(interval)
             LOGGER.debug("Stopped monitoring backup %s", backup_id)
 
+        threads = []
         if len(rules) > 0:
-            Thread(target=monitor, daemon=True).start()
+            # schedule cancelation based on rules
+            thread = Thread(target=monitor_rules, daemon=True)
+            thread.start()
+            threads.append((thread, stop_event.set))
+        if timeout and timeout > 0:
+            # schedule cancelation based on timeout
+            timer = Timer(
+                timeout,
+                lambda: cls.cancel_backup(backup_id, f"Timeout after {timeout}s."),
+            )
+            timer.start()
+            threads.append((timer, lambda: timer.cancel))
+        if threads:
+            with cls._lock:
+                cls._threads = threads
+
+    @classmethod
+    def cancel_backup(cls, backup_id, reason):
+        try:
+            current_backup_id = get_backup_id()
+            if current_backup_id and current_backup_id == backup_id:
+                LOGGER.warning(
+                    "Canceling backup with ID %s: %s",
+                    backup_id,
+                    reason,
+                )
+                _post_backup(backup_id, query={}, is_canceled=True)
+        except ArchivingNotPausedError:
+            # Suppress this error during backup cancellation
+            pass
+
+    @classmethod
+    def stop(cls, backup_id, timeout=None):
+        with cls._lock:
+            if cls._threads:
+                while cls._threads:
+                    thread, stop_fn = cls._threads.pop()
+                    stop_fn()
+                    thread.join(timeout=timeout)
+                LOGGER.debug("Stopped cancelation policy for backup %s", backup_id)
 
     @staticmethod
     def parse(policy_config):
@@ -494,17 +521,7 @@ class ScriptCancelationRule(CancelationRule):
         return float(out.decode("utf-8"))
 
 
-def schedule_cancellation(backup_id, timeout=None):
-    if timeout and timeout > 0:
-        # schedule cancelation based on timeout
-        Timer(
-            timeout, lambda: cancel_backup(backup_id, f"Timeout after {timeout}s.")
-        ).start()
-    # schedule cancelation based on configured policy
-    CancelationPolicy.apply(backup_id)
-
-
-def post_backup(backup_id, query):
+def _post_backup(backup_id, query, is_canceled=False):
     # Check that backup ID was specified
     if not backup_id:
         raise UserError("Backup ID not specified")
@@ -530,6 +547,10 @@ def post_backup(backup_id, query):
         if not processes:
             raise RuntimeError("No nuodb process found")
 
+        if not is_canceled:
+            # stop the cancelation policy if one is running for this backup ID
+            CancelationPolicy.stop(backup_id, timeout=60)
+
         # If the archive and journal are on separate volumes, we must unblock
         # writes to the archive
         if JOURNAL_DIR is not None:
@@ -549,6 +570,10 @@ def post_backup(backup_id, query):
         # Record the total duration of the snapshot operation
         if ctime:
             BACKUP_DURATION_SECONDS.observe(time.time() - ctime)
+
+
+def post_backup(backup_id, query):
+    _post_backup(backup_id, query)
 
 
 def remove_backup_files():
