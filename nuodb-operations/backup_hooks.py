@@ -593,6 +593,8 @@ def read_handler_config(handler_config):
 class RequestInfo(object):  # pylint: disable=too-few-public-methods
     def __init__(self, environ):
         self.method = environ.get("REQUEST_METHOD")
+        if self.method == "HEAD":
+            self.method = "GET"
         # Parse URL and make sure it contains at least one path component
         uri = wsgiref.util.request_uri(environ)
         self.parsed = urllib.parse.urlparse(uri)

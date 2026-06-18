@@ -23,7 +23,7 @@ def cores_handlers() -> list[tuple[str, str, callable]]:
     ]
 
 
-def list_cores(query: dict[str:Any]) -> list[tuple[str, int, str]]:
+def list_cores(query: dict[str:Any]) -> list[dict[str, Any]]:
     """List available cores
 
     query parameters:
@@ -49,10 +49,10 @@ def list_cores(query: dict[str:Any]) -> list[tuple[str, int, str]]:
         if after >= 0 and after >= timestamp:
             continue
         with open(core, "rb") as f:
-            filehash = hashlib.file_digest(f, hashlib.sha1).hexdigest()
-        entry = (name, int(timestamp), filehash)
+            checksum = hashlib.file_digest(f, hashlib.sha1).hexdigest()
+        entry = {"name": name, "timestamp": int(timestamp), "checksum": checksum}
         cores.append(entry)
-    cores.sort(key=itemgetter(0))
+    cores.sort(key=itemgetter("name"))
     return cores
 
 
