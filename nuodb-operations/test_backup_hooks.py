@@ -18,6 +18,7 @@ from threading import Thread
 from werkzeug.serving import make_server
 import sys
 import shlex
+import tempfile
 
 import metrics
 import backup_hooks
@@ -80,8 +81,7 @@ class HttpHandlersTests(unittest.TestCase):
         config = getattr(self, "server_config", {})
         testMethod = getattr(self, self._testMethodName)
         overrides = getattr(testMethod, "overrides", {})
-        config.update(overrides)
-        return config
+        return {**config, **overrides}
 
     def configure_server(self):
         server_config = self.get_server_config()
@@ -157,11 +157,12 @@ class HttpHandlersTests(unittest.TestCase):
         handler_config = self.configure_server()
         # configure cancelation policy
         cancel_rules = self.get_server_config().get("cancel_rules")
+        policy_config = os.path.join(self.test_dir, "cancel-policy.json")
         if cancel_rules:
-            policy_config = os.path.join(self.test_dir, "cancel-policy.json")
             with open(policy_config, "w") as f:
                 f.write(json.dumps(dict(rules=cancel_rules)))
-            backup_hooks.CancelationPolicy.load(policy_config)
+        # load the cancelation policy unconditionally as in main()
+        backup_hooks.CancelationPolicy.load(policy_config)
         # start HTTP server
         self.host = "127.0.0.1"
         self.port = self.get_local_port()
@@ -432,11 +433,11 @@ class BackupHooksTest(HttpHandlersTests):
         self.nuodb_processes_patch.stop()
         super().tearDown()
 
-    def pre_backup(self, backup_id, opaque=None):
+    def pre_backup(self, backup_id, opaque=None, timeout=None):
         resp, data = self.request(
             method="POST",
             path=f"/pre-backup/{backup_id}",
-            body=json.dumps(dict(opaque=opaque)),
+            body=json.dumps(dict(opaque=opaque, timeout=timeout)),
             headers={"Content-Type": "application/json"},
         )
         return resp, json.loads(data)
@@ -583,7 +584,7 @@ class BackupHooksExternalJournalTest(BackupHooksTest):
 
             # invoke pre-backup hook
             backup_id = str(uuid.uuid4())
-            resp, data = self.pre_backup(backup_id)
+            resp, data = self.pre_backup(backup_id, timeout=60)
             self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
             self.assertTrue(data["success"], "pre-backup hook reported failure")
 
@@ -594,7 +595,7 @@ class BackupHooksExternalJournalTest(BackupHooksTest):
 
             # verify that archive has been freezed
             self.freeze_archive_mock.assert_called_once_with(
-                backup_id, self.nuodb_processes_mock.return_value, timeout=None
+                backup_id, self.nuodb_processes_mock.return_value, timeout=60
             )
             self.freeze_archive_mock.reset_mock()
 
@@ -616,6 +617,13 @@ class BackupHooksExternalJournalTest(BackupHooksTest):
                 # verify monitoring thread has exited
                 assert any(
                     f"Stopped monitoring backup {backup_id}" in record.message
+                    for record in logs.records
+                ), logs.output
+
+                # verify that policy threads have been stopped
+                assert any(
+                    f"Stopped cancelation policy for backup {backup_id}"
+                    in record.message
                     for record in logs.records
                 ), logs.output
 
@@ -750,13 +758,13 @@ class BackupHooksExternalJournalTest(BackupHooksTest):
         with self.assertLogs(logger=LOGGER, level="DEBUG") as logs:
             # invoke pre-backup hook
             backup_id = str(uuid.uuid4())
-            resp, data = self.pre_backup(backup_id)
+            resp, data = self.pre_backup(backup_id, timeout=10)
             self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
             self.assertTrue(data["success"], "pre-backup hook reported failure")
 
             # verify that archive has been freezed
             self.freeze_archive_mock.assert_called_once_with(
-                backup_id, self.nuodb_processes_mock.return_value, timeout=None
+                backup_id, self.nuodb_processes_mock.return_value, timeout=10
             )
             self.freeze_archive_mock.reset_mock()
 
@@ -783,13 +791,7 @@ class BackupHooksExternalJournalTest(BackupHooksTest):
             )
 
             def assert_logs():
-                # verify that backup operation hasn't been canceled
-                assert not any(
-                    f"Canceling backup with ID {backup_id}" in record.message
-                    for record in logs.records
-                ), logs.output
-
-                # verify monitoring thread has exited
+                # verify monitoring threads have exited
                 assert any(
                     f"Stopped cancelation policy for backup {backup_id}"
                     in record.message
@@ -797,6 +799,83 @@ class BackupHooksExternalJournalTest(BackupHooksTest):
                 ), logs.output
 
             retry(assert_logs, 10)
+
+            # verify that backup operation hasn't been canceled
+            assert not any(
+                f"Canceling backup with ID {backup_id}" in record.message
+                for record in logs.records
+            ), logs.output
+
+    def testBackupCancelationPolicyNegative(self):
+        def parse_rules(rules_config):
+            with tempfile.NamedTemporaryFile(dir=self.test_dir, delete=False) as tmp:
+                tmp.write(json.dumps(dict(rules=rules_config)).encode("utf-8"))
+                tmp.close()
+                return backup_hooks.CancelationPolicy.parse(tmp.name)
+
+        # verify that rule with missing type is ignored
+        with self.assertLogs(logger=LOGGER) as logs:
+            rules_config = [
+                {
+                    "op": ">",
+                    "threshold": 80,
+                    "duration": 5,
+                }
+            ]
+            rules = parse_rules(rules_config)
+            assert not rules
+            assert any(
+                f"Ignoring invalid policy rule {rules_config[0]}" in record.message
+                for record in logs.records
+            ), logs.output
+
+        # verify that rule with invalid operation is ignored
+        with self.assertLogs(logger=LOGGER) as logs:
+            rules_config = [
+                {
+                    "type": "script",
+                    "script": "echo '0'",
+                    "op": "bogus",
+                    "threshold": 80,
+                    "duration": 5,
+                }
+            ]
+            rules = parse_rules(rules_config)
+            assert not rules
+            assert any(
+                f"Ignoring invalid policy rule {rules_config[0]}" in record.message
+                for record in logs.records
+            ), logs.output
+
+        # verify that rule with missing threshold is ignored
+        with self.assertLogs(logger=LOGGER) as logs:
+            rules_config = [
+                {
+                    "type": "script",
+                    "script": "echo '0'",
+                    "op": "!=",
+                }
+            ]
+            rules = parse_rules(rules_config)
+            assert not rules
+            assert any(
+                f"Ignoring invalid policy rule {rules_config[0]}" in record.message
+                for record in logs.records
+            ), logs.output
+
+        # verify that valid rules are returned
+        with self.assertLogs(logger=LOGGER) as logs:
+            rules_config = [
+                {"type": "script", "script": "echo '0'", "op": "bogus", "threshold": 0},
+                {"type": "journalUtilization", "op": ">", "threshold": 80},
+            ]
+            rules = parse_rules(rules_config)
+            assert len(rules) == 1
+            assert rules[0].RULE_TYPE == "journalUtilization"
+            assert any(
+                f"Ignoring invalid policy rule {rules_config[0]}" in record.message
+                for record in logs.records
+            ), logs.output
 
 
 class NoArchivesHandlersTest(HttpHandlersTests):

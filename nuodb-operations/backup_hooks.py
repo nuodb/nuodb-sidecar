@@ -323,7 +323,14 @@ class CancelationPolicy:
         rules = cls.parse(policy_config)
         if not rules and JOURNAL_DIR is not None:
             # add default cancelation rules
-            rules.append(JournalUtilizationRule.from_dict(op=">", threshold=80))
+            rules.append(
+                JournalUtilizationRule.from_dict(
+                    type="journalUtilization",
+                    op=">",
+                    threshold=80,
+                    duration=60,
+                )
+            )
         with cls._lock:
             cls._rules = rules
 
@@ -366,7 +373,7 @@ class CancelationPolicy:
                 lambda: cls.cancel_backup(backup_id, f"Timeout after {timeout}s."),
             )
             timer.start()
-            threads.append((timer, lambda: timer.cancel))
+            threads.append((timer, timer.cancel))
         if threads:
             with cls._lock:
                 cls._threads = threads
@@ -374,27 +381,35 @@ class CancelationPolicy:
     @classmethod
     def cancel_backup(cls, backup_id, reason):
         try:
-            current_backup_id = get_backup_id()
-            if current_backup_id and current_backup_id == backup_id:
-                LOGGER.warning(
-                    "Canceling backup with ID %s: %s",
-                    backup_id,
-                    reason,
-                )
-                _post_backup(backup_id, query={}, is_canceled=True)
+            with cls._lock:
+                current_backup_id = get_backup_id()
+                if current_backup_id and current_backup_id == backup_id:
+                    LOGGER.warning(
+                        "Canceling backup with ID %s: %s",
+                        backup_id,
+                        reason,
+                    )
+                    _post_backup(backup_id, query={}, is_canceled=True)
         except ArchivingNotPausedError:
             # Suppress this error during backup cancellation
             pass
+        finally:
+            # stop all policy threads without waiting
+            cls.stop(backup_id)
 
     @classmethod
     def stop(cls, backup_id, timeout=None):
+        wait_for = []
         with cls._lock:
-            if cls._threads:
-                while cls._threads:
-                    thread, stop_fn = cls._threads.pop()
-                    stop_fn()
-                    thread.join(timeout=timeout)
-                LOGGER.debug("Stopped cancelation policy for backup %s", backup_id)
+            while cls._threads:
+                thread, stop_fn = cls._threads.pop()
+                stop_fn()
+                wait_for.append(thread)
+        if timeout and timeout > 0:
+            # wait for all policy threads
+            for thread in wait_for:
+                thread.join(timeout=timeout)
+        LOGGER.debug("Stopped cancelation policy for backup %s", backup_id)
 
     @staticmethod
     def parse(policy_config):
@@ -409,20 +424,18 @@ class CancelationPolicy:
             rules = []
             with open(policy_config) as f:
                 config_data = json.loads(f.read())
-                rules_list = config_data.get("rules")
-                if rules_list:
-                    for rule in rules_list:
-                        rule_type = rule.get("type")
-                        if rule_type == "script":
-                            rules.append(ScriptCancelationRule.from_dict(**rule))
-                        elif (
-                            rule_type == "journalUtilization"
-                            and JOURNAL_DIR is not None
-                        ):
-                            rules.append(JournalUtilizationRule.from_dict(**rule))
-                        else:
-                            LOGGER.info(
-                                "Ignoring unknown policy rule type=%s", rule_type
+                rules_cfg = config_data.get("rules")
+                if rules_cfg:
+                    all_rules = CancelationRule.subclasses()
+                    for rule_config in rules_cfg:
+                        try:
+                            for cls in all_rules:
+                                rule = cls.from_dict(**rule_config)
+                                if rule:
+                                    rules.append(rule)
+                        except Exception:
+                            LOGGER.exception(
+                                "Ignoring invalid policy rule %s", rule_config
                             )
             return rules
         except Exception:
@@ -444,6 +457,7 @@ OPS = {
 
 class CancelationRule:
 
+    RULE_TYPE = None
     MSG_FMT = "{rule.name} value {value:.2f} is {rule.op} {rule.threshold} for more than {rule.duration}s"  # pylint: disable=line-too-long
 
     def __init__(
@@ -479,14 +493,31 @@ class CancelationRule:
             )
 
     @classmethod
+    def subclasses(cls):
+        seen = set()
+        queue = [cls]
+        while queue:
+            parent = queue.pop()
+            for child in parent.__subclasses__():
+                if child not in seen:
+                    seen.add(child)
+                    queue.append(child)
+        return seen
+
+    @classmethod
     def from_dict(cls, **kwargs):
-        name = kwargs.pop("name")
-        op = kwargs.pop("op")
-        threshold = kwargs.pop("threshold")
-        return cls(name, op, threshold, **kwargs)
+        """Returns an optional rule implementation based on its type."""
+        rule_type = kwargs.pop("type")
+        if cls.RULE_TYPE and cls.RULE_TYPE == rule_type:
+            name = kwargs.pop("name")
+            op = kwargs.pop("op")
+            threshold = kwargs.pop("threshold")
+            return cls(name, op, threshold, **kwargs)
 
 
 class JournalUtilizationRule(CancelationRule):
+
+    RULE_TYPE = "journalUtilization"
 
     def apply(self, **kwargs):
         if JOURNAL_DIR is not None:
@@ -496,12 +527,13 @@ class JournalUtilizationRule(CancelationRule):
 
     @classmethod
     def from_dict(cls, **kwargs):
-        op = kwargs.pop("op")
-        threshold = kwargs.pop("threshold")
-        return cls("Journal volume utilization percentage", op, threshold, **kwargs)
+        default_name = "Journal volume utilization percentage"
+        return super().from_dict(**{"name": default_name, **kwargs})
 
 
 class ScriptCancelationRule(CancelationRule):
+
+    RULE_TYPE = "script"
 
     def __init__(
         self, name, op, threshold, script, duration=None, timeout=60, **kwargs
