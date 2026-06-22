@@ -803,9 +803,14 @@ class CoresHandlersTest(HttpHandlersTests):
         self.assertLessEqual(core["timestamp"], ts_after)
         self.assertEqual(core["checksum"], hashlib.sha1(file_contents).hexdigest())
 
-        resp, _ = self.get_core(core_name, method="HEAD")
+        resp, data = self.get_core(core_name, method="HEAD")
         self.assertEqual(resp.status, http.HTTPStatus.OK)
-        self.assertEqual(int(resp.getheader("Content-Length")), len(file_contents), "Wrong Content-Length in HEAD response")
+        self.assertEqual(
+            int(resp.getheader("Content-Length")),
+            len(file_contents),
+            "Wrong Content-Length in HEAD response",
+        )
+        self.assertEqual(data, b"", "HEAD response should be empty")
 
         pagesize = 100
         for page_start in range(0, len(file_contents), pagesize):

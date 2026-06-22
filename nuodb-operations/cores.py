@@ -19,6 +19,7 @@ def cores_handlers() -> list[tuple[str, str, callable]]:
     """Get /cores handlers"""
     return [
         ("GET", "cores", [list_cores, get_core]),
+        ("HEAD", "cores", [get_core]),
         ("DELETE", "cores", [delete_core]),
     ]
 
