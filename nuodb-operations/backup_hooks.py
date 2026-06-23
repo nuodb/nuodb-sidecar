@@ -10,8 +10,10 @@ import sys
 import time
 import urllib
 import wsgiref.util
-from threading import Lock, Timer
+from threading import Lock, Timer, Thread, Event
 from shutil import which, disk_usage
+import operator
+import copy
 
 import werkzeug
 
@@ -30,6 +32,8 @@ FREEZE_TIMEOUT = os.environ.get("FREEZE_TIMEOUT")
 MODE_HOTSNAP = "hotsnap"
 MODE_FSFREEZE = "fsfreeze"
 MODE_SUSPEND = "suspend"
+
+CANCELATION_POLICY_INTERVAL = int(os.environ.get("CANCELATION_POLICY_INTERVAL", 5))
 
 
 def from_dir(base_dir, *args):
@@ -305,31 +309,251 @@ def pre_backup(backup_id, payload):
         if JOURNAL_DIR is not None:
             freeze_archive(backup_id, processes, timeout=timeout)
 
-        # Cancel backup operation after specified timeout
-        schedule_cancellation(backup_id, timeout)
+        # Schedule cancelation for the backup operation
+        CancelationPolicy.apply(backup_id, timeout=timeout)
 
 
-def schedule_cancellation(backup_id, timeout):
-    if timeout and timeout > 0:
+class CancelationPolicy:
+    _lock = Lock()
+    _rules = None
+    _threads = []
 
-        def cancel_backup():
-            try:
+    @classmethod
+    def load(cls, policy_config):
+        rules = cls.parse(policy_config)
+        if not rules and JOURNAL_DIR is not None:
+            # add default cancelation rules
+            rules.append(
+                JournalUtilizationRule.from_dict(
+                    type="journalUtilization",
+                    op=">",
+                    threshold=80,
+                    duration=60,
+                )
+            )
+        with cls._lock:
+            cls._rules = rules
+
+    @classmethod
+    def rules(cls):
+        with cls._lock:
+            if cls._rules is not None:
+                return [copy.deepcopy(r) for r in cls._rules]
+            return []
+
+    @classmethod
+    def apply(cls, backup_id, interval=CANCELATION_POLICY_INTERVAL, timeout=None):
+        rules = cls.rules()
+        stop_event = Event()
+
+        def monitor_rules():
+            while get_backup_id() == backup_id and not stop_event.is_set():
+                errors = []
+                for rule in rules:
+                    err_msg = rule.evaluate()
+                    if err_msg:
+                        errors.append(err_msg)
+                if len(errors) > 0:
+                    # some of the rules are satisfied so cancel the backup operation
+                    cls.cancel_backup(backup_id, "; ".join(errors))
+                    break
+                stop_event.wait(interval)
+            LOGGER.debug("Stopped monitoring backup %s", backup_id)
+
+        threads = []
+        if len(rules) > 0:
+            # schedule cancelation based on rules
+            thread = Thread(target=monitor_rules, daemon=True)
+            thread.start()
+            threads.append((thread, stop_event.set))
+        if timeout and timeout > 0:
+            # schedule cancelation based on timeout
+            timer = Timer(
+                timeout,
+                lambda: cls.cancel_backup(backup_id, f"Timeout after {timeout}s."),
+            )
+            timer.start()
+            threads.append((timer, timer.cancel))
+        if threads:
+            with cls._lock:
+                cls._threads = threads
+
+    @classmethod
+    def cancel_backup(cls, backup_id, reason):
+        try:
+            with cls._lock:
                 current_backup_id = get_backup_id()
                 if current_backup_id and current_backup_id == backup_id:
                     LOGGER.warning(
-                        "Canceling backup with ID %s. Timeout after %ds.",
+                        "Canceling backup with ID %s: %s",
                         backup_id,
-                        timeout,
+                        reason,
                     )
-                    post_backup(backup_id, query={})
-            except ArchivingNotPausedError:
-                # Suppress this error during backup cancellation
-                pass
+                    _post_backup(backup_id, query={}, is_canceled=True)
+        except ArchivingNotPausedError:
+            # Suppress this error during backup cancellation
+            pass
+        finally:
+            # stop all policy threads without waiting
+            cls.stop(backup_id)
 
-        Timer(timeout, cancel_backup).start()
+    @classmethod
+    def stop(cls, backup_id, timeout=None):
+        wait_for = []
+        with cls._lock:
+            while cls._threads:
+                thread, stop_fn = cls._threads.pop()
+                stop_fn()
+                wait_for.append(thread)
+        if timeout and timeout > 0:
+            # wait for all policy threads
+            for thread in wait_for:
+                thread.join(timeout=timeout)
+        LOGGER.debug("Stopped cancelation policy for backup %s", backup_id)
+
+    @staticmethod
+    def parse(policy_config):
+        if not policy_config:
+            return []
+        if not os.path.exists(policy_config):
+            LOGGER.info(
+                "Ignoring non-existent cancelation policy config %s", policy_config
+            )
+            return []
+        try:
+            rules = []
+            with open(policy_config) as f:
+                config_data = json.loads(f.read())
+                rules_cfg = config_data.get("rules")
+                if rules_cfg:
+                    all_rules = CancelationRule.subclasses()
+                    for rule_config in rules_cfg:
+                        try:
+                            for cls in all_rules:
+                                rule = cls.from_dict(**rule_config)
+                                if rule:
+                                    rules.append(rule)
+                        except Exception:
+                            LOGGER.exception(
+                                "Ignoring invalid policy rule %s", rule_config
+                            )
+            return rules
+        except Exception:
+            LOGGER.exception(
+                "Unable to process cancelation policy config %s", policy_config
+            )
+            return []
 
 
-def post_backup(backup_id, query):
+OPS = {
+    ">": (operator.gt, "greater than"),
+    "<": (operator.lt, "less than"),
+    ">=": (operator.ge, "greater than or equal to"),
+    "<=": (operator.le, "less than or equal to"),
+    "==": (operator.eq, "equal to"),
+    "!=": (operator.ne, "not equal to"),
+}
+
+
+class CancelationRule:
+
+    RULE_TYPE = None
+    MSG_FMT = "{rule.name} value {value:.2f} is {rule.op} {rule.threshold} for more than {rule.duration}s"  # pylint: disable=line-too-long
+
+    def __init__(
+        self, name, op, threshold, duration=60, **kwargs
+    ):  # pylint: disable=unused-argument
+        self.name = name
+        self.check = OPS[op][0]
+        self.op = OPS[op][1]
+        self.threshold = threshold
+        self.duration = duration
+        self._alert_time = None
+
+    def apply(self, **kwargs):
+        raise NotImplementedError()
+
+    def evaluate(self, **kwargs):
+        try:
+            now = time.monotonic()
+            value = self.apply(**kwargs)
+            LOGGER.debug("%s current value: %.2f", self.name, value)
+            # check if current value satisfies the threshold
+            if self.check(value, self.threshold):
+                if self._alert_time is None:
+                    self._alert_time = now
+                elif now - self._alert_time >= self.duration:
+                    return self.MSG_FMT.format(value=value, rule=self)
+            else:
+                # reset the time
+                self._alert_time = None
+        except Exception as e:
+            LOGGER.warning(
+                "Failed to evaluate cancelation rule name='%s': %s", self.name, str(e)
+            )
+
+    @classmethod
+    def subclasses(cls):
+        seen = set()
+        queue = [cls]
+        while queue:
+            parent = queue.pop()
+            for child in parent.__subclasses__():
+                if child not in seen:
+                    seen.add(child)
+                    queue.append(child)
+        return seen
+
+    @classmethod
+    def from_dict(cls, **kwargs):
+        """Returns an optional rule implementation based on its type."""
+        rule_type = kwargs.pop("type")
+        if cls.RULE_TYPE and cls.RULE_TYPE == rule_type:
+            name = kwargs.pop("name")
+            op = kwargs.pop("op")
+            threshold = kwargs.pop("threshold")
+            return cls(name, op, threshold, **kwargs)
+
+
+class JournalUtilizationRule(CancelationRule):
+
+    RULE_TYPE = "journalUtilization"
+
+    def apply(self, **kwargs):
+        if JOURNAL_DIR is not None:
+            total, used, _ = disk_usage(JOURNAL_DIR)
+            return (used / total) * 100
+        return 0
+
+    @classmethod
+    def from_dict(cls, **kwargs):
+        default_name = "Journal volume utilization percentage"
+        return super().from_dict(**{"name": default_name, **kwargs})
+
+
+class ScriptCancelationRule(CancelationRule):
+
+    RULE_TYPE = "script"
+
+    def __init__(
+        self, name, op, threshold, script, duration=None, timeout=60, **kwargs
+    ):  # pylint: disable=unused-argument
+        super().__init__(name, op, threshold, duration)
+        self.script = script
+        self.timeout = timeout
+
+    def apply(self, **kwargs):
+        out = subprocess.check_output(
+            self.script,
+            shell=True,
+            stderr=subprocess.STDOUT,
+            env=dict(os.environ),
+            timeout=self.timeout,
+        )
+        return float(out.decode("utf-8"))
+
+
+def _post_backup(backup_id, query, is_canceled=False):
     # Check that backup ID was specified
     if not backup_id:
         raise UserError("Backup ID not specified")
@@ -355,6 +579,10 @@ def post_backup(backup_id, query):
         if not processes:
             raise RuntimeError("No nuodb process found")
 
+        if not is_canceled:
+            # stop the cancelation policy if one is running for this backup ID
+            CancelationPolicy.stop(backup_id, timeout=60)
+
         # If the archive and journal are on separate volumes, we must unblock
         # writes to the archive
         if JOURNAL_DIR is not None:
@@ -374,6 +602,10 @@ def post_backup(backup_id, query):
         # Record the total duration of the snapshot operation
         if ctime:
             BACKUP_DURATION_SECONDS.observe(time.time() - ctime)
+
+
+def post_backup(backup_id, query):
+    _post_backup(backup_id, query)
 
 
 def remove_backup_files():
@@ -795,6 +1027,7 @@ def verify_prerequisites():
 def main():
     # Create CLI parser for direct invocation
     parser = argparse.ArgumentParser(sys.argv[0])
+    parser.add_argument("--cancel-policy", default="/etc/nuodb/cancel-policy.json")
     subparsers = parser.add_subparsers(dest="subcommand")
     # Register server subcommand
     subparser = subparsers.add_parser("server")
@@ -814,6 +1047,8 @@ def main():
     args = parser.parse_args(sys.argv[1:])
     if args.subcommand:
         verify_prerequisites()
+    # Load backup cancelation policy
+    CancelationPolicy.load(args.cancel_policy)
     if args.subcommand == "server":
         start_server(args.port, args.handler_config)
     if args.subcommand == "pre-hook":
