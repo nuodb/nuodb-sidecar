@@ -928,12 +928,12 @@ class CoresHandlersTest(HttpHandlersTests):
         resp, data = self.request(method="GET", path=path)
         return resp, json.loads(data)
 
-    def get_core(self, core_path, range_start="", range_end=""):
+    def get_core(self, core_path, method="GET", range_start="", range_end=""):
         headers = {}
         if range_start or range_end:
             headers["Range"] = f"bytes={range_start}-{range_end}"
         resp, data = self.request(
-            method="GET", path=f"/cores/{core_path}", headers=headers
+            method=method, path=f"/cores/{core_path}", headers=headers
         )
         return resp, data
 
@@ -984,11 +984,11 @@ class CoresHandlersTest(HttpHandlersTests):
         resp, cores = self.get_cores()
         self.assertEqual(resp.status, http.HTTPStatus.OK)
         self.assertEqual(len(cores), 1)
-        name, timestamp, filehash = cores[0]
-        self.assertEqual(name, core_name)
-        self.assertGreaterEqual(timestamp, ts_before)
-        self.assertLessEqual(timestamp, ts_after)
-        self.assertEqual(filehash, hashlib.sha1(file_contents).hexdigest())
+        core = cores[0]
+        self.assertEqual(core["name"], core_name)
+        self.assertGreaterEqual(core["timestamp"], ts_before)
+        self.assertLessEqual(core["timestamp"], ts_after)
+        self.assertEqual(core["checksum"], hashlib.sha1(file_contents).hexdigest())
 
         resp, core = self.get_core(core_name)
         self.assertEqual(resp.status, http.HTTPStatus.OK)
@@ -1054,20 +1054,19 @@ class CoresHandlersTest(HttpHandlersTests):
         self.assertEqual(resp.status, http.HTTPStatus.OK, cores)
         self.assertEqual(len(cores), len(expected_cores))
         for i, core in enumerate(cores):
-            name, timestamp, filehash = core
-            self.assertEqual(name, expected_cores[i])
-            self.assertGreaterEqual(timestamp, ts_before)
-            self.assertLessEqual(timestamp, ts_after)
-            self.assertEqual(filehash, expected_hash)
+            self.assertEqual(core["name"], expected_cores[i])
+            self.assertGreaterEqual(core["timestamp"], ts_before)
+            self.assertLessEqual(core["timestamp"], ts_after)
+            self.assertEqual(core["checksum"], expected_hash)
 
         resp, cores = self.get_cores(after=last_core_time)
         self.assertEqual(resp.status, http.HTTPStatus.OK, cores)
         self.assertEqual(len(cores), 1)
-        name, timestamp, filehash = cores[0]
-        self.assertEqual(name, "789T123-core.nuodb.abc.210")
-        self.assertGreaterEqual(timestamp, last_core_time)
-        self.assertLessEqual(timestamp, ts_after)
-        self.assertEqual(filehash, expected_hash)
+        core = cores[0]
+        self.assertEqual(core["name"], "789T123-core.nuodb.abc.210")
+        self.assertGreaterEqual(core["timestamp"], last_core_time)
+        self.assertLessEqual(core["timestamp"], ts_after)
+        self.assertEqual(core["checksum"], expected_hash)
 
         # Test that get and delete also ignore the non-core files
         resp, data = self.get_core("nuosm.log")
@@ -1108,11 +1107,20 @@ class CoresHandlersTest(HttpHandlersTests):
         resp, cores = self.get_cores()
         self.assertEqual(resp.status, http.HTTPStatus.OK)
         self.assertEqual(len(cores), 1)
-        name, timestamp, filehash = cores[0]
-        self.assertEqual(name, core_name)
-        self.assertGreaterEqual(timestamp, ts_before)
-        self.assertLessEqual(timestamp, ts_after)
-        self.assertEqual(filehash, hashlib.sha1(file_contents).hexdigest())
+        core = cores[0]
+        self.assertEqual(core["name"], core_name)
+        self.assertGreaterEqual(core["timestamp"], ts_before)
+        self.assertLessEqual(core["timestamp"], ts_after)
+        self.assertEqual(core["checksum"], hashlib.sha1(file_contents).hexdigest())
+
+        resp, data = self.get_core(core_name, method="HEAD")
+        self.assertEqual(resp.status, http.HTTPStatus.OK)
+        self.assertEqual(
+            int(resp.getheader("Content-Length")),
+            len(file_contents),
+            "Wrong Content-Length in HEAD response",
+        )
+        self.assertEqual(data, b"", "HEAD response should be empty")
 
         pagesize = 100
         for page_start in range(0, len(file_contents), pagesize):
