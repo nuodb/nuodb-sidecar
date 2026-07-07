@@ -23,6 +23,7 @@ import cores
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 LOGGER = logging.getLogger(__name__)
+REQ_LOGGER = logging.getLogger("RequestLog")
 
 ARCHIVE_DIR = os.environ.get("NUODB_ARCHIVE_DIR", "/mnt/archive")
 JOURNAL_DIR = os.environ.get("NUODB_JOURNAL_DIR")
@@ -823,7 +824,12 @@ def read_handler_config(handler_config):
 
 
 class RequestInfo(object):  # pylint: disable=too-few-public-methods
+
+    _request_counter = 0
+    _lock = Lock()
+
     def __init__(self, environ):
+        self.id = self._next_request_id()
         self.method = environ.get("REQUEST_METHOD")
         # Parse URL and make sure it contains at least one path component
         uri = wsgiref.util.request_uri(environ)
@@ -834,6 +840,12 @@ class RequestInfo(object):  # pylint: disable=too-few-public-methods
         # Decode query parameters and payload
         self.query_params = get_query_params(self.parsed.query)
         self.payload = get_payload(environ)
+
+    @classmethod
+    def _next_request_id(cls):
+        with cls._lock:
+            cls._request_counter += 1
+            return cls._request_counter
 
 
 def handle_method(req):
@@ -896,7 +908,9 @@ def create_response(environ, start_response, status, data=None):
     headers = []
     if isinstance(data, os.PathLike):
         resp = werkzeug.utils.send_file(data, environ, as_attachment=True)
-        return resp(environ, start_response)
+        return resp(environ, start_response), [
+            ("Content-Type", "application/octet-stream")
+        ]
     if isinstance(data, bytes):
         # If data can be decoded as JSON, use application/json
         try:
@@ -909,7 +923,7 @@ def create_response(environ, start_response, status, data=None):
         data = json.dumps(data, indent=4).encode("utf-8") + b"\n"
         headers.append(("Content-Type", "application/json"))
     start_response(status_str, headers)
-    return [data]
+    return [data], headers
 
 
 class HooksHandler(object):
@@ -958,8 +972,7 @@ class HooksHandler(object):
         if custom_handlers:
             LOGGER.info("Custom handlers:\n%s", "\n".join(custom_handlers))
 
-    def handle(self, environ):
-        req = RequestInfo(environ)
+    def handle(self, req):
         start_time = time.time()
         status = http.HTTPStatus.OK
         path = f"/{'/'.join(req.components)}"
@@ -989,9 +1002,40 @@ class HooksHandler(object):
                 str(status),
             ).observe(time.time() - start_time)
 
+    @staticmethod
+    def content_type(headers):
+        for k, v in headers:
+            if k == "Content-Type":
+                return v
+        return "application/octet-stream"
+
+    @staticmethod
+    def log_request(req):
+        if normalize_path(req.parsed.path) == "metrics":
+            # skip metrics endpoint
+            return
+        REQ_LOGGER.info("%d -> %s %s", req.id, req.method, req.parsed.path)
+        if req.payload:
+            REQ_LOGGER.info("%d -> %s", req.id, req.payload)
+
+    @staticmethod
+    def log_response(req, status, headers, resp):
+        if normalize_path(req.parsed.path) == "metrics":
+            # skip metrics endpoint
+            return
+        status_str = "{0.value} {0.phrase}".format(status)
+        REQ_LOGGER.info("%d <- %s", req.id, status_str)
+        if HooksHandler.content_type(headers) in ("application/json", "text/plain"):
+            for data in resp:
+                REQ_LOGGER.info("%d <- %s", req.id, data.decode("utf-8"))
+
     def __call__(self, environ, start_response):
-        status, json_response = self.handle(environ)
-        return create_response(environ, start_response, status, json_response)
+        req = RequestInfo(environ)
+        self.log_request(req)
+        status, data = self.handle(req)
+        resp, headers = create_response(environ, start_response, status, data)
+        self.log_response(req, status, headers, resp)
+        return resp
 
 
 def start_server(port, handler_config):
