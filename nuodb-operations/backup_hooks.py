@@ -551,6 +551,8 @@ class ScriptCancelationRule(CancelationRule):
             env=dict(os.environ),
             timeout=self.timeout,
         )
+        if out is None or len(out) == 0:
+            return 0.0
         return float(out.decode("utf-8"))
 
 
