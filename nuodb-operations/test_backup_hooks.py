@@ -23,7 +23,7 @@ import tempfile
 import metrics
 import backup_hooks
 import cores
-from backup_hooks import HooksHandler, LOGGER
+from backup_hooks import HooksHandler, LOGGER, REQ_LOGGER
 
 LOGGER.setLevel(logging.DEBUG)
 
@@ -416,6 +416,82 @@ class HttpHandlersTests(unittest.TestCase):
         data = json.loads(data)
         self.assertFalse(data["success"])
         self.assertEqual(data["message"], f"No handler found for path {test_path}")
+
+    @ConfigOverrides(
+        custom_handlers=[
+            {
+                "method": "POST",
+                "path": "/echo",
+                "script": "echo ${payload}",
+            },
+            {
+                "method": "GET",
+                "path": "/exit",
+                "script": "exit ${code:=0}",
+                "statusMappings": {"1": 500, "2": 400},
+            },
+        ]
+    )
+    def testRequestLog(self):
+        def assertRequestLogs(logs, req_id, method, path, status, payload=None):
+            assert any(
+                f"{req_id} -> {method} {path}" in record.message
+                for record in logs.records
+            ), logs.output
+            if payload:
+                assert any(
+                    f"{req_id} -> {payload}" in record.message
+                    for record in logs.records
+                ), logs.output
+            assert any(
+                f"{req_id} <- {status.value} {status.phrase}" in record.message
+                for record in logs.records
+            ), logs.output
+            if payload:
+                assert any(
+                    f"{req_id} <- {payload}" in record.message
+                    for record in logs.records
+                ), logs.output
+
+        with self.assertLogs(logger=REQ_LOGGER) as logs:
+            resp, data = self.request(method="POST", path="/echo", body="hello")
+            self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+            assertRequestLogs(logs, 1, "POST", "/echo", http.HTTPStatus.OK, "hello")
+
+        with self.assertLogs(logger=REQ_LOGGER) as logs:
+            resp, data = self.request(
+                method="POST", path="/echo", body='{"message": "Hello"}'
+            )
+            self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+            assertRequestLogs(
+                logs, 2, "POST", "/echo", http.HTTPStatus.OK, '{"message": "Hello"}'
+            )
+
+        with self.assertLogs(logger=REQ_LOGGER) as logs:
+            resp, data = self.request(method="GET", path="/exit")
+            self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+            assertRequestLogs(logs, 3, "GET", "/exit", http.HTTPStatus.OK)
+
+        with self.assertLogs(logger=REQ_LOGGER) as logs:
+            resp, data = self.request(method="GET", path="/exit?code=1")
+            self.assertEqual(
+                http.HTTPStatus.INTERNAL_SERVER_ERROR, resp.status, str(data)
+            )
+            assertRequestLogs(
+                logs, 4, "GET", "/exit", http.HTTPStatus.INTERNAL_SERVER_ERROR
+            )
+
+        with self.assertLogs(logger=REQ_LOGGER) as logs:
+            resp, data = self.request(method="GET", path="/exit?code=2")
+            self.assertEqual(http.HTTPStatus.BAD_REQUEST, resp.status, str(data))
+            assertRequestLogs(logs, 5, "GET", "/exit", http.HTTPStatus.BAD_REQUEST)
+
+            # verfy that /metrics endpoint is excluded from request logs
+            resp, data = self.request(method="GET", path="/metrics")
+            self.assertEqual(http.HTTPStatus.OK, resp.status, str(data))
+            assert not any(
+                f"-> GET /metrics" in record.message for record in logs.records
+            ), logs.output
 
 
 class BackupHooksTest(HttpHandlersTests):

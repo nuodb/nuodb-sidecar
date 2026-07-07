@@ -8,6 +8,7 @@ RUN set -ex; \
     apt-get install -y --no-install-recommends \
     libnss-wrapper \
     procps \
+    curl \
     ; \
     rm -rf /var/lib/apt/lists/*
 
