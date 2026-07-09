@@ -753,7 +753,7 @@ class BackupHooksExternalJournalTest(BackupHooksTest):
         self._testBackupCancelation(
             set_good,
             set_bad,
-            "Journal volume utilization percentage value 85.00 is greater than 80 for more than 5s",
+            "Journal volume utilization percentage value 85.00 is greater than 80.00 for more than 5s",
         )
 
     @ConfigOverrides(
@@ -783,7 +783,7 @@ class BackupHooksExternalJournalTest(BackupHooksTest):
         self._testBackupCancelation(
             set_good,
             set_bad,
-            "Memory throttling value 32.00 is greater than 0 for more than 5s",
+            "Memory throttling value 32.00 is greater than 0.00 for more than 5s",
         )
 
     @ConfigOverrides(
@@ -792,7 +792,7 @@ class BackupHooksExternalJournalTest(BackupHooksTest):
             {
                 "type": "journalUtilization",
                 "op": ">",
-                "threshold": 80,
+                "threshold": "80",
                 "duration": 5,
             },
             {
@@ -820,8 +820,8 @@ class BackupHooksExternalJournalTest(BackupHooksTest):
         self._testBackupCancelation(
             set_good,
             set_bad,
-            "Journal volume utilization percentage value 95.00 is greater than 80 for more than 5s; "
-            + "Memory throttling value 32.00 is greater than 0 for more than 5s",
+            "Journal volume utilization percentage value 95.00 is greater than 80.00 for more than 5s; "
+            + "Memory throttling value 32.00 is greater than 0.00 for more than 5s",
         )
 
     @ConfigOverrides(
