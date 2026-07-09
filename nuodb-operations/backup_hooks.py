@@ -459,7 +459,7 @@ OPS = {
 class CancelationRule:
 
     RULE_TYPE = None
-    MSG_FMT = "{rule.name} value {value:.2f} is {rule.op} {rule.threshold} for more than {rule.duration}s"  # pylint: disable=line-too-long
+    MSG_FMT = "{rule.name} value {value:.2f} is {rule.op} {rule.threshold:.2f} for more than {rule.duration}s"  # pylint: disable=line-too-long
 
     def __init__(
         self, name, op, threshold, duration=60, **kwargs
@@ -467,8 +467,8 @@ class CancelationRule:
         self.name = name
         self.check = OPS[op][0]
         self.op = OPS[op][1]
-        self.threshold = threshold
-        self.duration = duration
+        self.threshold = float(threshold)
+        self.duration = int(duration)
         self._alert_time = None
 
     def apply(self, **kwargs):
@@ -483,7 +483,7 @@ class CancelationRule:
             if self.check(value, self.threshold):
                 if self._alert_time is None:
                     self._alert_time = now
-                elif now - self._alert_time >= self.duration:
+                if now - self._alert_time >= self.duration:
                     return self.MSG_FMT.format(value=value, rule=self)
             else:
                 # reset the time
